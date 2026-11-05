@@ -1,0 +1,6 @@
+{
+  "zh": "SDK 示例，显示 TH06–TH20 整数作的关卡、机体和模式。TH08 额外统计计时调用。默认禁用。",
+  "en": "SDK example for integer titles TH06–TH20. Displays stage, shot, and mode, with timer counts on TH08. Disabled by default.",
+  "ja": "TH06～TH20 の整数作品向け SDK サンプル。ステージ、自機、モードを表示し、TH08 ではタイマー呼び出しも集計します。初期状態は無効です。",
+  "settings": true
+}

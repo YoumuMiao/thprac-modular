@@ -1,0 +1,5 @@
+{
+  "zh": "在游戏内信息栏显示 Boss 当前阶段血量、Boss 坐标和自机坐标。",
+  "en": "Shows current-phase boss HP, boss coordinates, and player coordinates in the in-game HUD.",
+  "ja": "ゲーム内情報にボスの現在フェーズの HP、ボス座標、自機座標を表示します。"
+}

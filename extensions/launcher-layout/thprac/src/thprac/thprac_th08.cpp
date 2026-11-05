@@ -1,0 +1,3640 @@
+#include "feature_runtime.h"
+#include "thprac_games.h"
+#include "thprac_gui_impl_dx8.h"
+#include "thprac_utils.h"
+#include "thprac_boss_capture.h"
+#include <format>
+#include "thprac_th08_rsqrt.h"
+
+#include <xmmintrin.h>
+
+namespace THPrac {
+    
+
+namespace TH08 {
+     int g_gamefence = 0;
+     bool g_show_bullet_hitbox=false;
+     int g_lock_timer = 0;
+     bool g_autobomb_trigger = false;
+
+     enum ADDRS {
+        SHOTTYPE_ADDR = 0x164d0b1,
+        STAGE_INDEX_ADDR = 0x164d2cc,
+        DIFF_ADDR = 0x160f538,
+        INPUT_ADDR = 0x164d528,
+        GUI_ADDR = 0x160f428,
+        STAGE_PENDING_INTERRUPT = 0x4ea290,
+        SPELLCARD_ID_ADDR = 0x4EA678,
+        MISS_COUNT_ADDR = 0x0164CFA4,
+        BOMB_COUNT_ADDR = 0x0164CFA8,
+        DEATHBOMB_COUNT_ADDR = 0x0164CFAC,
+        GAMEMODE_ADDR = 0x17CE8B0,
+        GAMEMODE_NEXT_ADDR = 0x17CE8B4,
+        GAMEMODE_PREV_ADDR = 0x17CE8B8,
+    };
+
+     enum ECL_OFFSETS {
+         ECL_TL_TIME = 0x0,
+         ECL_TL_OPCODE = 0x4,
+         ECL_TL_OFFNEXT = 0x6,
+         ECL_INS_TIME = 0x0,
+         ECL_INS_OPCODE = 0x4,
+         ECL_INS_ARG1 = 0xc,
+         ECL_INS_ARG2 = 0x10,
+     };
+
+     bool use_custom_rsqrt = false;
+     int custom_rsqrt_type = 0;
+     char custom_rsqrt_type_char[3] = { 'i', 'a','c'};
+
+     class RsqrtssCompatiable {
+        static const uint32_t RSQ_COUNT = 1u << 21;
+        static const uint32_t RSQ_SIZE_BYTES = RSQ_COUNT * 4u;
+        static const uint32_t RSQ_MANT_COUNT = 1u << 12;
+        static const uint32_t RSQ_INTEL_MANT_COUNT = 1u << 10;
+        static const uint32_t RSQ_PACK_BITS = 21;
+
+        static std::vector<char> buffer_i;
+        static std::vector<char> buffer_a;
+        static std::vector<char> buffer_custom;
+
+        class BitReader {
+        public:
+            BitReader(const uint8_t* data, size_t size)   : data_(data) , size_(size){ }
+
+            uint32_t Read(uint32_t bits) {
+                while (bitcount_ < bits) {
+                    if (pos_ >= size_) {
+                        throw std::runtime_error("truncated rsqrtss data");
+                    }
+                    bitbuf_ |= ((uint64_t)data_[pos_++]) << bitcount_;
+                    bitcount_ += 8;
+                }
+                const uint32_t mask = (1u << bits) - 1u;
+                const uint32_t value = (uint32_t)(bitbuf_ & mask);
+                bitbuf_ >>= bits;
+                bitcount_ -= bits;
+                return value;
+            }
+        private:
+            const uint8_t* data_;
+            size_t size_;
+            size_t pos_ = 0;
+            uint64_t bitbuf_ = 0;
+            uint32_t bitcount_ = 0;
+        };
+
+        static uint32_t ReadU32LE(const void* p)
+        {
+            const uint8_t* b = (const uint8_t*)p;
+            return (uint32_t)b[0]
+                | ((uint32_t)b[1] << 8)
+                | ((uint32_t)b[2] << 16)
+                | ((uint32_t)b[3] << 24);
+        }
+
+        static void WriteU32LE(char* p, uint32_t value)
+        {
+            p[0] = (char)(value & 0xffu);
+            p[1] = (char)((value >> 8) & 0xffu);
+            p[2] = (char)((value >> 16) & 0xffu);
+            p[3] = (char)((value >> 24) & 0xffu);
+        }
+
+        static uint32_t MakeSpecial(uint32_t sign, uint32_t exp, uint32_t mant12)
+        {
+            if (exp == 0) {
+                return sign ? 0xff800000u : 0x7f800000u;
+            }
+            if (exp == 255) {
+                if (!sign && mant12 == 0) {
+                    return 0x00000000u;
+                }
+                return (sign ? 0xffc00000u : 0x7fc00000u) | (mant12 << 11);
+            }
+            return 0xffc00000u;
+        }
+
+        template <uint32_t MANT_COUNT>
+        static void ReconstructOne(std::vector<char>& out, const uint32_t refs[2][MANT_COUNT])
+        {
+            out.assign(RSQ_SIZE_BYTES, 0);
+            for (uint32_t hi21 = 0; hi21 < RSQ_COUNT; ++hi21) {
+                const uint32_t sign = hi21 >> 20;
+                const uint32_t exp = (hi21 >> 12) & 0xffu;
+                const uint32_t mant12 = hi21 & 0xfffu;
+                uint32_t value;
+
+                if (sign || exp == 0 || exp == 255) {
+                    value = MakeSpecial(sign, exp, mant12);
+                } else {
+                    const uint32_t parity = exp & 1u;
+                    const uint32_t ref_exp = parity ? 127u : 126u;
+                    const uint32_t ref_index = (MANT_COUNT == RSQ_INTEL_MANT_COUNT) ? (mant12 >> 2) : mant12;
+                    const uint32_t ref = refs[parity][ref_index];
+                    const int ref_out_exp = (int)((ref >> 23) & 0xffu);
+                    const int out_exp = ref_out_exp - (((int)exp - (int)ref_exp) / 2);
+                    value = (ref & 0x807fffffu) | ((uint32_t)out_exp << 23);
+                }
+
+                WriteU32LE(out.data() + (size_t)hi21 * 4u, value);
+            }
+        }
+
+        static void Decompress(const uint8_t* rsqrtss_comp, size_t rsqrtss_comp_size)
+        {
+            if (rsqrtss_comp_size < 16
+                || rsqrtss_comp[0] != 'R'
+                || rsqrtss_comp[1] != 'S'
+                || rsqrtss_comp[2] != 'Q'
+                || rsqrtss_comp[3] != '2') {
+                throw std::runtime_error("bad rsqrtss data header");
+            }
+            if (ReadU32LE(rsqrtss_comp + 4) != RSQ_INTEL_MANT_COUNT
+                || ReadU32LE(rsqrtss_comp + 8) != RSQ_MANT_COUNT
+                || ReadU32LE(rsqrtss_comp + 12) != RSQ_PACK_BITS) {
+                throw std::runtime_error("unsupported rsqrtss data version");
+            }
+
+            uint32_t intel_refs[2][RSQ_INTEL_MANT_COUNT];
+            uint32_t amd_refs[2][RSQ_MANT_COUNT];
+            BitReader br(rsqrtss_comp + 16, rsqrtss_comp_size - 16);
+
+            for (uint32_t t = 0; t < 2; ++t) {
+                for (uint32_t mant10 = 0; mant10 < RSQ_INTEL_MANT_COUNT; ++mant10) {
+                    intel_refs[t][mant10] = br.Read(RSQ_PACK_BITS) << 11;
+                }
+            }
+            for (uint32_t t = 0; t < 2; ++t) {
+                for (uint32_t mant12 = 0; mant12 < RSQ_MANT_COUNT; ++mant12) {
+                    amd_refs[t][mant12] = br.Read(RSQ_PACK_BITS) << 11;
+                }
+            }
+
+            ReconstructOne(buffer_i, intel_refs);
+            ReconstructOne(buffer_a, amd_refs);
+        }
+
+        static void GetCustomBuffer()
+        {
+            buffer_custom.assign(RSQ_SIZE_BYTES, 0);
+            for (uint32_t hi21 = 0; hi21 < RSQ_COUNT; ++hi21) {
+                const uint32_t input_bits = hi21 << 11;
+                float res = CurrentRsqrt(*(float*)&input_bits);
+                const uint32_t output_bits = *(uint32_t*)&res;
+                WriteU32LE(buffer_custom.data() + (size_t)hi21 * 4u, output_bits);
+            }
+        }
+
+        static float CurrentRsqrt(float input)
+        {
+            __m128 v = _mm_set_ss(input);
+            v = _mm_rsqrt_ss(v);
+            return _mm_cvtss_f32(v);
+        }
+
+    public:
+        static void Init()
+        {
+            Decompress(th08_rsqrt_data, sizeof(th08_rsqrt_data));
+            GetCustomBuffer();
+        }
+
+        static bool SetCustomBuffer(char* filename)
+        {
+            FILE* fp = nullptr;
+            if (fopen_s(&fp, filename, "rb") != 0 || !fp) {
+                return false;
+            }
+
+            std::vector<char> data(RSQ_SIZE_BYTES);
+            const size_t n = std::fread(data.data(), 1, data.size(), fp);
+            std::fclose(fp);
+            if (n != data.size()) {
+                return false;
+            }
+
+            buffer_custom.swap(data);
+        }
+
+        static bool ExportCustomBuffer(char* filename)
+        {
+            if (buffer_custom.size() != RSQ_SIZE_BYTES) {
+                GetCustomBuffer();
+            }
+            FILE* fp = nullptr;
+            if (fopen_s(&fp, filename, "wb") != 0 || !fp) {
+                return false;
+            }
+            const size_t n = std::fwrite(buffer_custom.data(), 1, buffer_custom.size(), fp);
+            std::fclose(fp);
+            if (n != buffer_custom.size()) {
+                return false;
+            }
+        }
+
+        static float Rsqrt_CPU(const char* buffer_i_arg, const char* buffer_a_arg, float input, char CPU_type)
+        {
+            if (CPU_type == 'd' || CPU_type == 'D') {
+                return CurrentRsqrt(input);
+            }
+            const char* table;
+            if (CPU_type == 'a' || CPU_type == 'A') {
+                if (!buffer_a_arg) {
+                    buffer_a_arg = buffer_a.data();
+                }
+                table = buffer_a_arg;
+            } else if (CPU_type == 'c' || CPU_type == 'C') {
+                if (buffer_custom.size() != RSQ_SIZE_BYTES) {
+                    GetCustomBuffer();
+                }
+                table = buffer_custom.data();
+            } else {
+                if (!buffer_i_arg) {
+                    buffer_i_arg = buffer_i.data();
+                }
+                table = buffer_i_arg;
+            }
+
+            const uint32_t input_bits = *(uint32_t*)(&input);
+            const uint32_t hi21 = input_bits >> 11;
+            const uint32_t output_bits = ReadU32LE(table + (size_t)hi21 * 4u);
+            return *(float*)(&output_bits);
+        }
+    };
+
+    std::vector<char> RsqrtssCompatiable::buffer_i;
+    std::vector<char> RsqrtssCompatiable::buffer_a;
+    std::vector<char> RsqrtssCompatiable::buffer_custom;
+
+    static uint8_t* GetXmmPtr32(PCONTEXT pCtx, int xmmIndex)
+    {
+        return (uint8_t*)pCtx->ExtendedRegisters + 160 + xmmIndex * 16;
+    }
+
+    static void EmulateRsqrtssXmmXmm(PCONTEXT pCtx, char cpuType, int a, int b)
+    {
+        uint8_t* xmmA = GetXmmPtr32(pCtx, a);
+        uint8_t* xmmB = GetXmmPtr32(pCtx, b);
+
+        uint32_t inputBits;
+        std::memcpy(&inputBits, xmmB, sizeof(inputBits));
+
+        const float input = *(float*)(&inputBits);
+        const float output = RsqrtssCompatiable::Rsqrt_CPU(
+            nullptr,
+            nullptr,
+            input,
+            cpuType);
+
+        const uint32_t outputBits = *(uint32_t*)(&output);
+        std::memcpy(xmmA, &outputBits, sizeof(outputBits));
+        pCtx->Eip += 4;
+    }
+
+    #define HOOK_RSQRTSS(TARGET, XMMA, XMMB) \
+    EHOOK_DY(rsqrt, TARGET, 4, { \
+        EmulateRsqrtssXmmXmm(pCtx, custom_rsqrt_type_char[custom_rsqrt_type], XMMA, XMMB);\
+    })
+
+    HOOKSET_DEFINE(RSQRT_HOOKS)
+    HOOK_RSQRTSS(0x48D452, 3, 3)
+    HOOK_RSQRTSS(0x48D527, 3, 3)
+    HOOK_RSQRTSS(0x48DA95, 5, 4)
+    HOOK_RSQRTSS(0x48E324, 0, 0)
+    HOOK_RSQRTSS(0x48E424, 5, 5)
+    HOOK_RSQRTSS(0x48E56C, 0, 0)
+    HOOK_RSQRTSS(0x48E6C8, 5, 4)
+    HOOK_RSQRTSS(0x48F032, 3, 3)
+    HOOK_RSQRTSS(0x48F107, 3, 3)
+    HOOK_RSQRTSS(0x48F3B4, 0, 0)
+    HOOK_RSQRTSS(0x48F4B4, 5, 5)
+    HOOK_RSQRTSS(0x48F5FC, 0, 0)
+    HOOKSET_ENDDEF()
+
+    #undef HOOK_RSQRTSS
+
+    using std::pair;
+    struct THPracParam {
+        int32_t mode;
+        int32_t stage;
+        int32_t warp;
+        int32_t section;
+        int32_t phase;
+        int32_t frame;
+        int32_t mimic;
+        float life;
+        float bomb;
+        float power;
+        int16_t gauge;
+        int64_t score;
+        int32_t graze;
+        int32_t point;
+        int32_t point_total;
+        int32_t point_stage;
+        int32_t time;
+        int32_t value;
+        int32_t night;
+        int32_t familiar;
+        int32_t rank;
+        bool rankLock;
+
+        bool dlg;
+
+        bool sp1_pts; // Mystia normal 2
+        int bsX;
+        int bsY;
+
+        bool _playLock = false;
+        void Reset()
+        {
+            memset(this, 0, sizeof(THPracParam));
+        }
+        bool ReadJson(std::string& json)
+        {
+            Reset();
+            ParseJson();
+
+            ForceJsonValue(game, "th08");
+            GetJsonValue(mode);
+            GetJsonValue(stage);
+            GetJsonValue(section);
+            GetJsonValue(phase);
+            GetJsonValueEx(dlg, Bool);
+            GetJsonValue(frame);
+            GetJsonValue(life);
+            GetJsonValue(bomb);
+            GetJsonValue(power);
+            GetJsonValue(gauge);
+            GetJsonValue(score);
+            GetJsonValue(graze);
+            GetJsonValue(point);
+            GetJsonValue(point_total);
+            GetJsonValue(point_stage);
+            GetJsonValue(time);
+            GetJsonValue(value);
+            GetJsonValue(night);
+            GetJsonValue(familiar);
+            GetJsonValue(rank);
+            GetJsonValueEx(rankLock, Bool);
+
+            GetJsonValueEx(sp1_pts, Bool);
+            GetJsonValue(bsX);
+            GetJsonValue(bsY);
+
+            return true;
+        }
+        std::string GetJson()
+        {
+            CreateJson();
+
+            AddJsonValueEx(version, GetVersionStr(), jalloc);
+            AddJsonValueEx(game, "th08", jalloc);
+            AddJsonValue(mode);
+            AddJsonValue(stage);
+            if (section)
+                AddJsonValue(section);
+            if (phase)
+                AddJsonValue(phase);
+            if (frame)
+                AddJsonValue(frame);
+            if (dlg)
+                AddJsonValue(dlg);
+            if (sp1_pts)
+            {
+                AddJsonValue(sp1_pts);
+                AddJsonValue(bsX);
+                AddJsonValue(bsY);
+            }
+            AddJsonValueEx(life, (int)life);
+            AddJsonValueEx(bomb, (int)bomb);
+            AddJsonValueEx(power, (int)power);
+            AddJsonValue(gauge);
+            AddJsonValue(score);
+            AddJsonValue(graze);
+            AddJsonValue(point_total);
+            AddJsonValue(point_stage);
+            AddJsonValue(time);
+            AddJsonValue(value);
+            AddJsonValue(night);
+            AddJsonValue(familiar);
+            AddJsonValue(rank);
+            AddJsonValue(rankLock);
+
+            ReturnJson();
+        }
+    };
+    THPracParam thPracParam {};
+
+    class THGuiPrac : public Gui::GameGuiWnd {
+        THGuiPrac() noexcept
+        {
+            SetPracticePanel();
+            *mLife = 8;
+            *mBomb = 8;
+            *mPower = 128;
+            mGauge.SetCurrentStep(5000);
+            *mMode = 1;
+            *mValue = 60000;
+            *mRank = 12;
+
+            SetFade(0.8f, 0.1f);
+            SetStyle(ImGuiStyleVar_WindowRounding, 0.0f);
+            SetStyle(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            OnLocaleChange();
+        }
+        SINGLETON(THGuiPrac)
+    public:
+
+        __declspec(noinline) void State(int state)
+        {
+            int gaugeType = 0;
+            switch (state) {
+            case 0:
+                break;
+            case 1:
+                SetFade(0.8f, 0.1f);
+                Open();
+                mDiffculty = (int)(*((int8_t*)0x17ce891));
+                switch (*((int8_t*)0x164d0b1)) {
+                case 2: // scarlet team
+                    mGauge.SetBound(-10000, 10000);
+                    gaugeType = -1;
+                    break;
+                case 3: // ghost team
+                    mGauge.SetBound(-5000, 10000);
+                    gaugeType = 1;
+                    break;
+                case 10: // solo youmu
+                    mGauge.SetBound(-5000, 5000);
+                    gaugeType = 2;
+                    break;
+                case 4:
+                case 6:
+                case 8:
+                    mGauge.SetBound(-10000, 2000);
+                    gaugeType = 3;
+                    break;
+                case 5:
+                case 7:
+                case 9:
+                case 11:
+                    mGauge.SetBound(-2000, 10000);
+                    gaugeType = 4;
+                    break;
+                default:
+                    mGauge.SetBound(-10000, 10000);
+                    gaugeType = 0;
+                    break;
+                }
+                if (mGaugeType != gaugeType) {
+                    switch (gaugeType) {
+                    case -1: // scarlet team
+                        *mGauge = 10000;
+                        break;
+                    case 1: // ghost team
+                        *mGauge = -5000;
+                        break;
+                    case 2: // solo youmu
+                        *mGauge = -5000;
+                        break;
+                    default:
+                        *mGauge = 0;
+                        break;
+                    }
+                    
+                }
+                mGaugeType = gaugeType;
+                break;
+            case 2:
+                break;
+            case 3:
+                SetFade(0.8f, 0.8f);
+                Close();
+
+                // Fill Param
+                thPracParam.mode = *mMode;
+                thPracParam.stage = *mStage;
+                thPracParam.section = CalcSection();
+                thPracParam.phase = SpellPhase() ? *mPhase : 0;
+                thPracParam.frame = *mFrame;
+                if (SectionHasDlg(thPracParam.section))
+                    thPracParam.dlg = *mDlg;
+
+                thPracParam.bsX = *mBossX;
+                thPracParam.bsY = *mBossY;
+                thPracParam.sp1_pts = *mDropPoints;
+
+                thPracParam.life = (float)*mLife;
+                thPracParam.bomb = (float)*mBomb;
+                thPracParam.power = (float)*mPower;
+                thPracParam.gauge = (int16_t)*mGauge;
+                thPracParam.score = *mScore;
+                thPracParam.graze = *mGraze;
+                thPracParam.point = 0;
+                thPracParam.point_total = *mPointTotal;
+                thPracParam.point_stage = *mPointStage;
+                thPracParam.time = *mTime;
+                thPracParam.value = *mValue;
+                thPracParam.night = *mNight;
+                thPracParam.familiar = *mFamiliar;
+                thPracParam.rank = *mRank;
+                thPracParam.rankLock = *mRankLock;
+                break;
+            case 4:
+                Close();
+                *mNavFocus = 0;
+                break;
+            default:
+                break;
+            }
+        }
+
+    protected:
+        virtual void OnLocaleChange() override
+        {
+            SetTitle(S(TH_MENU));
+            switch (Gui::LocaleGet()) {
+            case Gui::LOCALE_ZH_CN:
+                SetSize(370.f, 390.f);
+                SetPos(245.f, 75.f);
+                SetItemWidth(-60.0f);
+                break;
+            case Gui::LOCALE_EN_US:
+                SetSize(440.f, 375.f);
+                SetPos(190.f, 75.f);
+                SetItemWidth(-80.0f);
+                break;
+            case Gui::LOCALE_JA_JP:
+                SetSize(380.f, 390.f);
+                SetPos(250.f, 75.f);
+                SetItemWidth(-65.0f);
+                break;
+            default:
+                break;
+            }
+        }
+        virtual void OnContentUpdate() override
+        {
+            Gui::PracticeHeader();
+            ImGui::Separator();
+
+            PracticeMenu();
+        }
+        const th_glossary_t* SpellPhase()
+        {
+            auto section = CalcSection();
+            if (section == TH08_ST6A_LS) {
+                return TH08_SPELL_5PHASE;
+            } else if (section == TH08_ST7_END_LS)
+                return TH08_SPELL_PHASE_IMPERISHABLE_SHOOTING;
+            return nullptr;
+        }
+        void PracticeMenu()
+        {
+            Gui::PracticeSection(false);
+            mMode();
+            if (mStage())
+                *mSection = *mChapter = 0;
+            if (*mMode == 1) {
+                if (*mStage != 9) { // LW
+                    int mbs = -1;
+                    if (*mStage == 3 || *mStage == 4) { // Counting from 0
+                        mbs = 2;
+                        if (*mWarp == 2)
+                            *mWarp = 0;
+                    }
+
+                    if (mWarp(mbs))
+                        *mSection = *mChapter = *mPhase = *mFrame = 0;
+                    if (*mWarp) {
+                        SectionWidget();
+                        mPhase(TH_PHASE, SpellPhase());
+
+                        // Mystia normal 2
+                        auto section = CalcSection();
+                        if (section == TH08_ST2_BOSS3) {
+                            if (mDropPoints()){
+                                // set some default
+                                *mBossX = 48;
+                                *mBossY = 96;
+                                *mPower = 127;
+                            }
+                            ImGui::SetNextItemWidth(100.0f);
+                            mBossX("%d");
+                            ImGui::SetNextItemWidth(128.0f);
+                            ImGui::SameLine();
+                            mBossY("%d");
+                        }
+                    }
+                }else{
+                    *mWarp = 5;
+                    SectionWidget();
+                }
+
+                Gui::PracticeSection(true);
+                mLife();
+                mBomb();
+                mPower();
+
+                char temp_str[256];
+                float gauge_f = (float)*mGauge / 100.0f;
+                sprintf_s(temp_str, "%3.2f%%%%", gauge_f);
+                mGauge(temp_str);
+
+                mScore();
+                mScore.RoundDown(10);
+                mGraze();
+                mPointTotal();
+                mPointStage();
+                mTime();
+                mValue();
+                mValue.RoundDown(10);
+
+                auto night = *mNight;
+                if (night < 2)
+                    sprintf_s(temp_str, "11:%s", night % 2 ? "30" : "00");
+                else
+                    sprintf_s(temp_str, "%02d:%s", (night - 2) / 2, night % 2 ? "30" : "00");
+                mNight(temp_str);
+
+                if (CheckIfBoss()) {
+                    mFamiliar();
+                }
+
+                mRank();
+                mRankLock();
+                if (mDiffculty > 1)
+                    mRank.SetBound(8, *mRankLock ? 99 : 12);
+                else
+                    mRank.SetBound(8, *mRankLock ? 99 : 16);
+            }
+
+            mNavFocus();
+        }
+
+        int CalcSection()
+        {
+            int chapterId = 0;
+            switch (*mWarp) {
+            case 1: // Chapter
+                // Chapter Id = 10000 + Stage * 100 + Section
+                chapterId += (*mStage + 1) * 100;
+                chapterId += *mChapter;
+                chapterId += 10000; // Base of chapter ID is 1000.
+                return chapterId;
+                break;
+            case 2:
+            case 3: // Mid boss & End boss
+                return th_sections_cba[*mStage][*mWarp - 2][*mSection];
+                break;
+            case 4:
+            case 5: // Non-spell & Spellcard
+                return th_sections_cbt[*mStage][*mWarp - 4][*mSection];
+                break;
+            default:
+                return 0;
+                break;
+            }
+        }
+        bool SectionHasDlg(int32_t section)
+        {
+            switch (section) {
+            case 10000 + 4 * 100 + 5:
+            case 10000 + 5 * 100 + 5:
+            case TH08_ST1_BOSS1:
+            case TH08_ST2_BOSS1:
+            case TH08_ST3_BOSS1:
+            case TH08_ST4A_BOSS1:
+            case TH08_ST4B_BOSS1:
+            case TH08_ST5_BOSS1:
+            case TH08_ST6A_BOSS1:
+            case TH08_ST6A_MID1:
+            case TH08_ST6B_BOSS1:
+            case TH08_ST6B_MID1:
+            case TH08_ST7_END_NS1:
+            case TH08_ST7_MID1:
+                return true;
+            default:
+                return false;
+            }
+        }
+        void SectionWidget()
+        {
+            static char chapterStr[256] {};
+            auto& chapterCounts = mChapterSetup[*mStage];
+
+            switch (*mWarp) {
+            case 1: // Chapter
+                mChapter.SetBound(1, chapterCounts[0] + chapterCounts[1]);
+
+                if (chapterCounts[1] == 0) {
+                    sprintf_s(chapterStr, S(TH_STAGE_PORTION_N), *mChapter);
+                } else if (*mChapter <= chapterCounts[0]) {
+                    sprintf_s(chapterStr, S(TH_STAGE_PORTION_1), *mChapter);
+                } else {
+                    sprintf_s(chapterStr, S(TH_STAGE_PORTION_2), *mChapter - chapterCounts[0]);
+                };
+                mChapter(chapterStr);
+                if ((*mStage == 3 && *mChapter == 5) || (*mStage == 4 && *mChapter == 5)){
+                    mDlg();
+                }
+                break;
+            case 2:
+            case 3: // Mid boss & End boss
+                if (mSection(TH_WARP_SELECT_FRAME[*mWarp],
+                        th_sections_cba[*mStage][*mWarp - 2],
+                        th_sections_str[::THPrac::Gui::LocaleGet()][mDiffculty]))
+                    *mPhase = 0;
+                if (SectionHasDlg(th_sections_cba[*mStage][*mWarp - 2][*mSection]))
+                    mDlg();
+                break;
+            case 4:
+            case 5: // Non-spell & Spellcard
+                if (mSection(TH_WARP_SELECT_FRAME[*mWarp],
+                        th_sections_cbt[*mStage][*mWarp - 4],
+                        th_sections_str[::THPrac::Gui::LocaleGet()][mDiffculty]))
+                    *mPhase = 0;
+                if (SectionHasDlg(th_sections_cbt[*mStage][*mWarp - 4][*mSection]))
+                    mDlg();
+                break;
+            case 6:
+                mFrame();
+                break;
+            }
+        }
+        bool CheckIfBoss()
+        {
+            auto section = CalcSection();
+            for (auto s : th_sections_cba[*mStage][0]) {
+                if (section == s) {
+                    return true;
+                }
+            }
+            for (auto s : th_sections_cba[*mStage][1]) {
+                if (section == s) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Data
+        Gui::GuiCombo mMode { TH_MODE, TH_MODE_SELECT };
+        Gui::GuiCombo mStage { TH_STAGE, TH08_STAGE_SELECT };
+        Gui::GuiCombo mWarp { TH_WARP, TH_WARP_SELECT_FRAME };
+        Gui::GuiCombo mSection { TH_MODE };
+        Gui::GuiCombo mPhase { TH_PHASE };
+        Gui::GuiCheckBox mDlg { TH_DLG };
+
+        Gui::GuiCheckBox mDropPoints { TH08_ST2N2_POINTS };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mBossX { TH_BOSSX,-160,160 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mBossY { TH_BOSSY,48,128 };
+
+        Gui::GuiSlider<int, ImGuiDataType_S32> mChapter { TH_CHAPTER, 0, 0 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mFrame { TH_FRAME, 0, INT_MAX };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mLife { TH_LIFE, 0, 8 };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mBomb { TH_BOMB, 0, 8 };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mPower { TH_POWER, 0, 128 };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mGauge { TH08_GAUGE, -10000, 10000, 1, 1000 };
+        Gui::GuiDrag<int64_t, ImGuiDataType_S64> mScore { TH_SCORE, 0, 9999999990, 10, 100000000 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mGraze { TH_GRAZE, 0, INT_MAX, 1, 10000 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mPoint { TH_POINT, 0, 9999, 1, 1000 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mPointTotal { TH_POINT_TOTAL, 0, 9999, 1, 1000 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mPointStage { TH_POINT_STAGE, 0, 9999, 1, 1000 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mTime { TH08_TIME, 0, INT_MAX, 1, 1000 };
+        Gui::GuiDrag<int, ImGuiDataType_S32> mValue { TH08_VALUE, 0, 9999999, 10, 100000 };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mFamiliar { TH08_FAMILIAR, 0, 2000, 1, 100 };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mNight { TH08_NIGHT, 0, 11, 1, 1 };
+        Gui::GuiSlider<int, ImGuiDataType_S32> mRank { TH_BULLET_RANK, 8, 16, 1, 10, 10 };
+        Gui::GuiCheckBox mRankLock { TH_BULLET_RANKLOCK };
+
+        Gui::GuiNavFocus mNavFocus { TH_STAGE, TH_MODE, TH_WARP, TH_FRAME, TH_DLG,
+            TH08_ST2N2_POINTS, TH_BOSSX, TH_BOSSY,
+            TH_MID_STAGE, TH_END_STAGE, TH_NONSPELL, TH_SPELL, TH_PHASE, TH_CHAPTER,
+            TH_LIFE, TH_BOMB, TH_POWER, TH08_GAUGE, TH_SCORE, TH_GRAZE, TH_POINT, TH_POINT_TOTAL, TH_POINT_STAGE,
+            TH08_TIME, TH08_VALUE,  TH08_NIGHT, TH_BULLET_RANK, TH_BULLET_RANKLOCK };
+
+        int mChapterSetup[10][2] {
+            { 1, 1 },
+            { 4, 0 },
+            { 2, 1 },
+            { 4, 2 },
+            { 4, 2 },
+            { 3, 2 },
+            { 2, 0 },
+            { 2, 0 },
+            { 3, 4 },
+            { 0, 0 }, //LW chapters
+        };
+
+        int mGaugeType;
+        int mDiffculty = 0;
+    };
+    class THGuiRep : public Gui::GameGuiWnd {
+        THGuiRep() noexcept
+        {
+        }
+        SINGLETON(THGuiRep)
+    public:
+
+        void CheckReplay()
+        {
+            uint32_t index = GetMemContent(0x18bde08, 0xc28c);
+            char* raw = (char*)GetMemAddr(0x18bde08, index * 512 + 0x70);
+            std::wstring repName = mb_to_utf16(raw, 932);
+            mRouteReplayName = repName;
+
+            std::string param;
+            if (ReplayLoadParam(repName.c_str(), param) && mRepParam.ReadJson(param))
+                mParamStatus = true;
+            else
+                mRepParam.Reset();
+        }
+
+        std::wstring mRouteReplayName;
+        const wchar_t* RouteReplayName() const { return mRouteReplayName.c_str(); }
+        bool mRepStatus = false;
+        void State(int state)
+        {
+            switch (state) {
+            case 1:
+                thPracParam.Reset();
+                mRepStatus = false;
+                mParamStatus = false;
+                break;
+            case 2:
+                CheckReplay();
+                break;
+            case 3:
+                mRepStatus = true;
+                if (mParamStatus)
+                    memcpy(&thPracParam, &mRepParam, sizeof(THPracParam));
+                break;
+            default:
+                break;
+            }
+        }
+
+    protected:
+        bool mParamStatus = false;
+        THPracParam mRepParam;
+    };
+    class THOverlay : public Gui::GameGuiWnd {
+        THOverlay() noexcept
+        {
+            SetTitle("Mod Menu");
+            SetFade(0.5f, 0.5f);
+            SetPos(10.0f, 10.0f);
+            SetSize(0.0f, 0.0f);
+            SetWndFlag(
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | 0);
+            OnLocaleChange();
+        }
+        SINGLETON(THOverlay)
+    public:
+
+    protected:
+        virtual void OnLocaleChange() override
+        {
+            float x_offset_1 = 0.0f;
+            float x_offset_2 = 0.0f;
+            switch (Gui::LocaleGet()) {
+            case Gui::LOCALE_ZH_CN:
+                x_offset_1 = 0.12f;
+                x_offset_2 = 0.172f;
+                break;
+            case Gui::LOCALE_EN_US:
+                x_offset_1 = 0.12f;
+                x_offset_2 = 0.16f;
+                break;
+            case Gui::LOCALE_JA_JP:
+                x_offset_1 = 0.18f;
+                x_offset_2 = 0.235f;
+                break;
+            default:
+                break;
+            }
+
+            mMenu.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mMuteki.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mInfLives.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mInfBombs.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mInfPower.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mTimeLock.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mAutoBomb.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mElBgm.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mInGameInfo.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mEnemyMuteki.SetTextOffsetRel(x_offset_1, x_offset_2);
+        }
+        virtual void OnContentUpdate() override
+        {
+            mMuteki();
+            mInfLives();
+            mInfBombs();
+            mInfPower();
+            mTimeLock();
+            mAutoBomb();
+            mElBgm();
+            mInGameInfo();
+            mEnemyMuteki();
+        }
+        virtual void OnPreUpdate() override
+        {
+            if (mMenu(false) && !ImGui::IsAnyItemActive()) {
+                if (*mMenu) {
+                    Open();
+                } else {
+                    Close();
+                    *((int32_t*)0x17ce8cc) = 2;
+                }
+            }
+        }
+
+        Gui::GuiHotKeyChord mMenu { "ModMenuToggle", "BACKSPACE", Gui::GetBackspaceMenuChord() };
+        
+        HOTKEY_DEFINE(mMuteki, TH_MUTEKI, "F1", VK_F1)
+        PATCH_HK(0x44abda, "B970A64E00E8BC1F0000E9C0020000"),
+        PATCH_HK(0x44Ab86, "03")
+        HOTKEY_ENDDEF();
+       
+        HOTKEY_DEFINE(mInfBombs, TH_INFBOMBS, "F3", VK_F3)
+        PATCH_HK(0x44CA78, "00"),
+        PATCH_HK(0x44CAA4, "00"),
+        PATCH_HK(0x44CA5D, "01")
+        HOTKEY_ENDDEF();
+
+        HOTKEY_DEFINE(mInfPower, TH_INFPOWER, "F4", VK_F4)
+        PATCH_HK(0x44CDB1, "00"),
+        PATCH_HK(0x44CDA2, "909090909090909090909090")
+        HOTKEY_ENDDEF();
+
+    public:
+        HOTKEY_DEFINE(mInfLives, TH_INFLIVES2, "F2", VK_F2)
+        PATCH_HK(0x44D0EE, "90"),
+        PATCH_HK(0x44CD8D, "909090909090")
+        HOTKEY_ENDDEF();
+
+        HOTKEY_DEFINE(mTimeLock, TH_TIMELOCK, "F5", VK_F5)
+        PATCH_HK(0x416CBE, "2ee9"),
+        PATCH_HK(0x42DDB5, "eb")
+        HOTKEY_ENDDEF();
+
+        HOTKEY_DEFINE(mAutoBomb, TH_AUTOBOMB, "F6", VK_F6)
+        //PATCH_HK(0x44CC18, "ff89"),
+        //PATCH_HK(0x44CC21, "66C70528D5640102"),
+        //PATCH_HK(0x44C85D, "30")
+        EHOOK_HK(0x44CC21, 3, {
+            if (pCtx->Edx != 0)
+                g_autobomb_trigger = true;
+            else
+                g_autobomb_trigger = false;
+        }),
+        EHOOK_HK(0x44C861, 3, {
+            if (((pCtx->Edx & 2) == 0) && !g_autobomb_trigger)
+                pCtx->Eip = 0x44CB87;
+            else
+                pCtx->Eip = 0x44C86C;
+            g_autobomb_trigger = false;
+        })
+        HOTKEY_ENDDEF();
+
+    public:
+        Gui::GuiHotKey mElBgm { TH_EL_BGM, "F7", VK_F7 };
+        Gui::GuiHotKey mInGameInfo { THPRAC_INGAMEINFO, "F8", VK_F8 };
+
+        HOTKEY_DEFINE(mEnemyMuteki, TH_ENEMY_MUTEKI, "U", 'U')
+        PATCH_HK(0x42D349, "909090909090"),
+        PATCH_HK(0x42B452, "909090")
+        HOTKEY_ENDDEF();
+    };
+
+    
+    // TH08 keeps a native per-spell history table. Diffing the per-shot capture
+    // and failure counters yields finished attempts without needing an attack
+    // start signal, so the rate stays exact even when a spell times out.
+    // Layout taken from the game's own end-of-spell update (FUN_004161b0):
+    //   entry = 0x160f548 + 0x22c * spell_id
+    //   entry+0x1f4[shot] captures, entry+0x158[shot] failures
+    static void Th08BossCapturePoll()
+    {
+        if (!AddonEnabled(Addon::Capture)) return;
+        // The canonical ECL bridge owns TH08 recording; this native mirror only
+        // remains as a fallback for builds without it.
+        if (BossCapture::NativeBridgeActive())
+            return;
+        if (THGuiRep::singleton().mRepStatus)
+            return;
+
+        constexpr uintptr_t kHistoryBase = 0x160f548;
+        constexpr int kHistoryStride = 0x22c;
+        constexpr int kCaptureOffset = 0x1f4;
+        constexpr int kFailureOffset = 0x158;
+        constexpr int kSpellCount = 205;
+
+        struct Watch {
+            int spell = -1;
+            int shot = 0;
+            int baseCapture = 0;
+            int baseFailure = 0;
+        };
+        static Watch current;
+        static Watch previous;
+
+        const int spell = *(int32_t*)SPELLCARD_ID_ADDR;
+        const int shot = *(uint8_t*)SHOTTYPE_ADDR;
+        const int stage = *(int32_t*)0x164d2cc;
+        const int difficulty = *(int32_t*)DIFF_ADDR;
+
+        auto read = [](int id, int shotIndex, int& captures, int& failures) {
+            if (id < 0 || id >= kSpellCount || shotIndex < 0 || shotIndex > 5)
+                return false;
+            const uintptr_t entry = kHistoryBase + uintptr_t(id) * kHistoryStride;
+            captures = *(int32_t*)(entry + kCaptureOffset + shotIndex * 4);
+            failures = *(int32_t*)(entry + kFailureOffset + shotIndex * 4);
+            return true;
+        };
+        auto sync = [&](Watch& watch) {
+            if (watch.spell < 0)
+                return;
+            int captures = 0, failures = 0;
+            if (!read(watch.spell, watch.shot, captures, failures))
+                return;
+            int newCaptures = captures - watch.baseCapture;
+            int newFailures = failures - watch.baseFailure;
+            watch.baseCapture = captures;
+            watch.baseFailure = failures;
+            if (newCaptures < 0) newCaptures = 0; // table replaced or reset
+            if (newFailures < 0) newFailures = 0;
+            if (newCaptures > 8) newCaptures = 8; // ignore corrupt jumps
+            if (newFailures > 8) newFailures = 8;
+            if (!newCaptures && !newFailures)
+                return;
+            BossCapture::Context context;
+            context.game = 8;
+            context.difficulty = difficulty;
+            context.shot = shot;
+            BossCapture::SetContext(context);
+            BossCapture::RecordCompleted(stage + 1, watch.spell + 1, BossCapture::kSpell,
+                newCaptures, newFailures);
+        };
+
+        if (spell >= 0 && spell < kSpellCount && spell != current.spell) {
+            previous = current; // keep one generation for a late counter update
+            current.spell = spell;
+            current.shot = shot;
+            read(current.spell, current.shot, current.baseCapture, current.baseFailure);
+        }
+        sync(previous);
+        sync(current);
+    }
+
+    class TH08InGameInfo : public Gui::GameGuiWnd {
+
+        TH08InGameInfo() noexcept
+        {
+            SetInformationPanel(true);
+            SetTitle("igi");
+            SetFade(0.9f, 0.9f);
+            SetPosRel(450.0f / 640.0f, 220.0f / 480.0f);
+            SetSizeRel(170.0f / 640.0f, 0.0f);
+            SetWndFlag(ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | 
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | 0);
+            OnLocaleChange();
+        }
+        SINGLETON(TH08InGameInfo)
+
+    public:
+        int32_t mMissCount;
+        int32_t mBombCount;
+        int32_t mLSCCount;
+        int32_t mSCCount;
+        int32_t mDesolveCount;
+
+    protected:
+        virtual void OnLocaleChange() override
+        {
+            float x_offset_1 = 0.0f;
+            float x_offset_2 = 0.0f;
+            switch (Gui::LocaleGet()) {
+            case Gui::LOCALE_ZH_CN:
+                x_offset_1 = 0.12f;
+                x_offset_2 = 0.172f;
+                break;
+            case Gui::LOCALE_EN_US:
+                x_offset_1 = 0.12f;
+                x_offset_2 = 0.16f;
+                break;
+            case Gui::LOCALE_JA_JP:
+                x_offset_1 = 0.18f;
+                x_offset_2 = 0.235f;
+                break;
+            default:
+                break;
+            }
+        }
+
+        virtual void OnContentUpdate() override
+        {
+            mMissCount = *(int8_t*)(0x0164CFA4);
+            mBombCount = *(int8_t*)(0x0164CFA8) + *(int8_t*)(0x0164CFAC);
+            
+            byte cur_player_type = *(byte*)(0x164d0b1);
+            int32_t diff = *((int32_t*)0x160f538);
+            if (diff == 1 
+                && (((*(int32_t*)0x164D0B4) & 0x4000) == 0x4000)
+                && *(WORD*)(0x164D0B8) >= 205 
+                && *(WORD*)(0x164D0B8) <= 221)
+                diff = 7;//LW
+            auto diff_pl = std::format("{} ({})", S(IGI_DIFF[diff]), S(IGI_PL_08[cur_player_type]));
+            auto diff_pl_sz = ImGui::CalcTextSize(diff_pl.c_str());
+
+            ImGui::SetCursorPosX(ImGui::GetWindowSize().x * 0.5f - diff_pl_sz.x * 0.5f);
+            ImGui::Text(diff_pl.c_str());
+
+            ImGui::Columns(2);
+            ImGui::Text(S(THPRAC_INGAMEINFO_MISS_COUNT));
+            ImGui::NextColumn();
+            ImGui::Text("%8d (%d)", mMissCount, mDesolveCount);
+            ImGui::NextColumn();
+            ImGui::Text(S(THPRAC_INGAMEINFO_BOMB_COUNT));
+            ImGui::NextColumn();
+            ImGui::Text("%8d", mBombCount);
+            ImGui::NextColumn();
+            ImGui::Text(S(THPRAC_INGAMEINFO_08_SC_COUNT));
+            ImGui::NextColumn();
+            ImGui::Text("%8d", mSCCount);
+            ImGui::NextColumn();
+            ImGui::Text(S(THPRAC_INGAMEINFO_08_LSC_COUNT));
+            ImGui::NextColumn();
+            ImGui::Text("%8d", mLSCCount);
+        }
+
+        virtual void OnPreUpdate() override
+        {
+            DWORD gameState = GetMemContent(GAMEMODE_ADDR);
+            if (gameState == 2) {
+                GameUpdateInner(8);
+                Th08BossCapturePoll();
+            } else {
+                g_gamefence = 0;
+            }
+            if (*(THOverlay::singleton().mInGameInfo) && (gameState == 2)) {
+                SetPosRel(450.0f / 640.0f, 220.0f / 480.0f);
+                SetSizeRel(170.0f / 640.0f, 0.0f);
+                Open();
+            } else {
+                Close();
+            }
+        }
+
+    public:
+    };
+
+    
+    EHOOK_ST(th08_all_clear_bonus_1, 0x435f8e, 2, {
+        pCtx->Eip = 0x435f92;
+    });
+    EHOOK_ST(th08_all_clear_bonus_2, 0x4384b9, 2, {
+        pCtx->Eip = 0x4384c1;
+    });
+    EHOOK_ST(th08_all_clear_bonus_3, 0x438568, 2, {
+        pCtx->Eip = 0x438570;
+    });
+    PATCH_ST(th08_DOSWNC_1, 0x415A4E, "39C0");
+    PATCH_ST(th08_DOSWNC_2, 0x416463, "39C0");
+
+    EHOOK_ST(th08_forceLS, 0x41FB44, 2, {
+        pCtx->Edx = 2;
+    });
+    EHOOK_ST(th08_master_disable1, 0x417C6B, 3 ,{
+            int captured = pCtx->Edx;
+            if (captured <= 999)
+                return;
+            std::string str = std::format("{}", captured);
+
+            DWORD thiz = *(DWORD*)(pCtx->Ebp - 0x28);
+            *(float*)(thiz + 8920) = *(float*)(thiz + 8920) + 28.0f;
+
+            float inc = 25.0f / (float)str.size();
+            for (auto ch : str) {
+                *(DWORD*)(thiz + 0x22F4) = asm_call<0x406880, Thiscall, DWORD>(*(DWORD*)(0x4D50A8), ch - '0' + 136);
+                asm_call<0x462FF0, Thiscall>(*(DWORD*)0x018BDC90, thiz + 0x20D0);
+                *(float*)(thiz + 8920) += inc;
+            }
+            *(float*)(thiz + 8920) -= inc;
+            pCtx->Eip = 0x00417DB8;
+    });
+    EHOOK_ST(th08_master_disable2, 0x00417DF6,7,{
+            int captured = pCtx->Ecx;
+            if (captured <= 999)
+                return;
+            std::string str = std::format("{}", captured);
+
+            DWORD thiz = *(DWORD*)(pCtx->Ebp - 0x28);
+            *(float*)(thiz + 8920) = *(float*)(thiz + 8920) + 7.0f;
+
+            float inc = 25.0f / (float)str.size();
+            for (auto ch : str) {
+                *(DWORD*)(thiz + 0x22F4) = asm_call<0x406880, Thiscall, DWORD>(*(DWORD*)(0x4D50A8), ch - '0' + 136);
+                asm_call<0x462FF0, Thiscall>(*(DWORD*)0x018BDC90, thiz + 0x20D0);
+                *(float*)(thiz + 8920) += inc;
+            }
+            pCtx->Eip = 0x417F41;
+    });
+
+
+    class THAdvOptWnd : public Gui::PPGuiWnd {
+    private:
+        void MasterDisableInit()
+        {
+            th08_master_disable1.Setup();
+            th08_master_disable2.Setup();
+            th08_master_disable1.Toggle(g_adv_igi_options.disable_master_autoly);
+            th08_master_disable2.Toggle(g_adv_igi_options.disable_master_autoly);
+        }
+        void FpsInit()
+        {
+            if ((mOptCtx.vpatch_base = (uintptr_t)GetModuleHandleW(L"openinputlagpatch.dll")) != NULL) {
+                OILPInit(mOptCtx);
+            } else if ((mOptCtx.vpatch_base = (uintptr_t)GetModuleHandleW(L"vpatch_th08.dll")) != NULL) {
+                uint64_t hash[2];
+                CalcFileHash(L"vpatch_th08.dll", hash);
+                if (hash[0] != 14324321420199198230ll || hash[1] != 10561235471127337137ll)
+                    mOptCtx.fps_status = -1;
+                else if (*(int32_t*)(mOptCtx.vpatch_base + 0x17024) == 0) {
+                    mOptCtx.fps_status = 2;
+                    mOptCtx.fps = *(int32_t*)(mOptCtx.vpatch_base + 0x17034);
+                }
+            } else
+                mOptCtx.fps_status = 0;
+        }
+        void FpsSet()
+        {
+            if (mOptCtx.fps_status == 3) {
+                mOptCtx.oilp_set_game_fps(mOptCtx.fps);
+                mOptCtx.oilp_set_replay_skip_fps(mOptCtx.fps_replay_fast);
+                mOptCtx.oilp_set_replay_slow_fps(mOptCtx.fps_replay_slow);
+            } else if (mOptCtx.fps_status == 1){
+                mOptCtx.fps_dbl = 1.0 / (double)mOptCtx.fps;
+            }
+            else if (mOptCtx.fps_status == 2) {
+                *(int32_t*)(mOptCtx.vpatch_base + 0x15a4c) = mOptCtx.fps;
+                *(int32_t*)(mOptCtx.vpatch_base + 0x17034) = mOptCtx.fps;
+            }
+        }
+        void GameplayInit()
+        {
+            th08_all_clear_bonus_1.Setup();
+            th08_all_clear_bonus_2.Setup();
+            th08_all_clear_bonus_3.Setup();
+            th08_DOSWNC_1.Setup();
+            th08_DOSWNC_2.Setup();
+        }
+        void GameplaySet()
+        {
+            th08_all_clear_bonus_1.Toggle(mOptCtx.all_clear_bonus);
+            th08_all_clear_bonus_2.Toggle(mOptCtx.all_clear_bonus);
+            th08_all_clear_bonus_3.Toggle(mOptCtx.all_clear_bonus);
+        }
+
+        THAdvOptWnd() noexcept
+        {
+            SetMouseOnly();
+            SetWndFlag(ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove);
+            SetFade(0.8f, 0.8f);
+            SetStyle(ImGuiStyleVar_WindowRounding, 0.0f);
+            SetStyle(ImGuiStyleVar_WindowBorderSize, 0.0f);
+
+            InitUpdFunc([&]() { ContentUpdate(); },
+                [&]() { LocaleUpdate(); },
+                [&]() {},
+                []() {});
+
+            OnLocaleChange();
+            FpsInit();
+            GameplayInit();
+            MasterDisableInit();
+
+            th08_forceLS.Setup();
+            th08_forceLS.Toggle(g_adv_igi_options.th08_forceLS);
+        }
+        SINGLETON(THAdvOptWnd)
+
+    public:
+        __declspec(noinline) static bool StaticUpdate(bool togglePressed)
+        {
+            auto& advOptWnd = THAdvOptWnd::singleton();
+
+            if (togglePressed) {
+                if (advOptWnd.IsOpen())
+                    advOptWnd.Close();
+                else
+                    advOptWnd.Open();
+            }
+            advOptWnd.Update();
+
+            return advOptWnd.IsOpen();
+        }
+
+    protected:
+        void LocaleUpdate()
+        {
+            SetTitle(S(TH_SPELL_PRAC));
+            switch (Gui::LocaleGet()) {
+            case Gui::LOCALE_ZH_CN:
+                SetSizeRel(1.0f, 1.0f);
+                SetPosRel(0.0f, 0.0f);
+                SetItemWidthRel(-0.0f);
+                SetAutoSpacing(true);
+                break;
+            case Gui::LOCALE_EN_US:
+                SetSizeRel(1.0f, 1.0f);
+                SetPosRel(0.0f, 0.0f);
+                SetItemWidthRel(-0.0f);
+                SetAutoSpacing(true);
+                break;
+            case Gui::LOCALE_JA_JP:
+                SetSizeRel(1.0f, 1.0f);
+                SetPosRel(0.0f, 0.0f);
+                SetItemWidthRel(-0.0f);
+                SetAutoSpacing(true);
+                break;
+            default:
+                break;
+            }
+        }
+        void ContentUpdate()
+        {
+            static bool DOSWNC = false;
+            *((int32_t*)0x17ce8cc) = 2;
+            ImGui::TextUnformatted(S(TH_ADV_OPT));
+            ImGui::Separator();
+            ImGui::BeginChild("Adv. Options", ImVec2(0.0f, 0.0f));
+
+            if (BeginOptGroup<TH_GAME_SPEED>()) {
+                if (GameFPSOpt(mOptCtx))
+                    FpsSet();
+                EndOptGroup();
+            }
+            if (BeginOptGroup<TH_GAMEPLAY>()) {
+                DisableKeyOpt(nullptr, nullptr, false);
+                KeyHUDOpt();
+                InfLifeOpt();
+                if (ImGui::Button(S(TH_ONE_KEY_DIE)))
+                {
+                    if (*(DWORD*)(0x160f510))
+                    {
+                        *(float*)(*(DWORD*)(0x160f510) + 0x74) = 0.0f;
+                        *(float*)(*(DWORD*)(0x160f510) + 0x80) = 0.0f;// prevent autobomb
+                        *(BYTE*)(0x017D5EF8) = 2;
+                    }
+                }
+                ImGui::SameLine();
+                HelpMarker(S(TH_ONE_KEY_DIE_DESC));
+
+                if (ImGui::Checkbox(S(THPRAC_FIX_RSQRT), &use_custom_rsqrt)) {
+                    if (use_custom_rsqrt) {
+                        EnableAllHooks(RSQRT_HOOKS);
+                    }else{
+                        DisableAllHooks(RSQRT_HOOKS);
+                    }
+                }
+                ImGui::SameLine();
+                HelpMarker(S(THPRAC_FIX_RSQRT_DESC));
+                if (use_custom_rsqrt){
+                    
+                    ImGui::SetNextItemWidth(200.0f);
+                    ImGui::Combo(S(THPRAC_SELECT_CPU), &custom_rsqrt_type, S(THPRAC_SELECT_CPU_COMBO));
+                    
+                    if (ImGui::Button(S(THPRAC_EXPORT_CUSTOM))) {
+                        RsqrtssCompatiable::ExportCustomBuffer("custom_bin.bin");
+                    }
+
+                    ImGui::SameLine();
+                    HelpMarker(S(THPRAC_EXPORT_CUSTOM_DESC));
+                    ImGui::SameLine();
+                    if (ImGui::Button(S(THPRAC_IMPORT_CUSTOM))) {
+                        RsqrtssCompatiable::SetCustomBuffer("custom_bin.bin");
+                    }
+
+                    ImGui::SameLine();
+                    HelpMarker(S(THPRAC_IMPORT_CUSTOM_DESC));
+
+                }
+
+                if (ImGui::Checkbox(S(TH_DISABLE_MASTER), &g_adv_igi_options.disable_master_autoly)) {
+                    th08_master_disable1.Toggle(g_adv_igi_options.disable_master_autoly);
+                    th08_master_disable2.Toggle(g_adv_igi_options.disable_master_autoly);
+                }
+                if (ImGui::Checkbox(S(THPRAC_TH08_FORCE_LS), &g_adv_igi_options.th08_forceLS)) {
+                    th08_forceLS.Toggle(g_adv_igi_options.th08_forceLS);
+                }
+
+                ImGui::Checkbox(S(TH_ENABLE_LOCK_TIMER), &g_adv_igi_options.enable_lock_timer_autoly);
+
+                ImGui::Checkbox(S(THPRAC_SHOW_BULLET_HITBOX), &g_show_bullet_hitbox);
+
+                if (GameplayOpt(mOptCtx))
+                    GameplaySet();
+
+                if (ImGui::Checkbox(S(TH08_DOSWNC), &DOSWNC)) {
+                    th08_DOSWNC_1.Toggle(DOSWNC);
+                    th08_DOSWNC_2.Toggle(DOSWNC);
+                }
+                EndOptGroup();
+            }
+            InGameReactionTestOpt();
+            AboutOpt();
+            ImGui::EndChild();
+            // ImGui::SetWindowFocus();
+        }
+
+        adv_opt_ctx mOptCtx;
+    };
+
+    void* THStage4ANM()
+    {
+        void* buffer = (void*)GetMemContent(0x18bdc90, 0x98);
+        if (thPracParam.mode == 1 && thPracParam.stage >= 3 && thPracParam.stage <= 4 && thPracParam.section) {
+            VFile anm;
+            anm.SetFile(buffer, 0x99999);
+            anm << pair{0x8029c, 0} << pair{0x802b0, 0} << pair{0x802bc, 4000}
+                << pair{0x802f8, 0} << pair{0x8030c, 0} << pair{0x802fc, 1};
+        }
+
+        return nullptr;
+    }
+
+    struct __th08_ins_header {
+        int32_t time;
+        int16_t opcode;
+        int16_t length;
+        int16_t rankMask;
+        int16_t paramMask;
+    };
+    EHOOK_ST(th08_name_fix, 0x42a8fb, 3, {
+        int32_t temp;
+        if (thPracParam.mode == 1) {
+            int32_t name = 0;
+            switch (thPracParam.stage) {
+            case 5:
+                if (thPracParam.section < TH08_ST5_BOSS1)
+                    break;
+                name = 0x16;
+                break;
+            case 6:
+                if (thPracParam.section == 0)
+                    break;
+                *((int32_t*)0x4e4b64) = 2;
+                break;
+            case 7:
+                if (thPracParam.section == 0)
+                    break;
+                temp = *((int32_t*)0x4ecc9c);
+                *((int32_t*)0x4ecc9c) = *((int32_t*)0x4ecca0);
+                *((int32_t*)0x4ecca0) = temp;
+                *((int32_t*)0x4e4b64) = 2;
+                name = 0x18;
+                break;
+            case 8:
+                if (thPracParam.section < TH08_ST7_END_NS1)
+                    break;
+                temp = *((int32_t*)0x4ecc9c);
+                *((int32_t*)0x4ecc9c) = *((int32_t*)0x4ecca0);
+                *((int32_t*)0x4ecca0) = temp;
+                *((int32_t*)0x4e4b64) = 2;
+                name = 0x19;
+                break;
+            default:
+                break;
+            }
+            if (name) {
+                asm_call<0x437f5c, Fastcall>(name);
+            }
+        }
+        self->Disable();
+    });
+    void ECLWarp(int32_t time1, int32_t offset1,
+        int32_t time2 = -1, int32_t offset2 = -1,
+        int32_t time3 = -1, int32_t offset3 = -1,
+        int32_t time4 = -1, int32_t offset4 = -1)
+    {
+        int32_t* target = (int32_t*)0xf54cf8;
+        int32_t pECL = *((int32_t*)0x4ECCB8);
+
+        if (time1 != -1) {
+            target[0] = time1;
+            if (offset1 != -1)
+                target[1] = pECL + offset1;
+        }
+        target += 4;
+        if (time2 != -1) {
+            target[0] = time2;
+            if (offset2 != -1)
+                target[1] = pECL + offset2;
+        }
+        target += 4;
+        if (time3 != -1) {
+            target[0] = time3;
+            if (offset3 != -1)
+                target[1] = pECL + offset3;
+        }
+        target += 4;
+        if (time4 != -1) {
+            target[0] = time4;
+            if (offset4 != -1)
+                target[1] = pECL + offset4;
+        }
+        target += 4;
+    }
+    void ECLTimeFix(int offset, int32_t time, unsigned int count)
+    {
+        __th08_ins_header* ins = (__th08_ins_header*)GetMemAddr(0x4ECCB8, offset);
+        for (unsigned int i = 0; i < count; ++i) {
+            ins->time = time;
+            ins = (__th08_ins_header*)((int32_t)ins + ins->length);
+        }
+    }
+    void ECLCallSub(ECLHelper& ecl, int offset, int sub_id, int ecl_time = -1, bool stall = false)
+    {
+        ecl.SetPos(offset);
+        ecl << (ecl_time == -1 ? 0 : ecl_time) << 0x00100034 << 0x0000ff00
+            << sub_id;
+        if (stall)
+            ecl << 0xffffffff << 0x000Cffff << 0x00FFff00;
+    }
+    void ECLJump(ECLHelper& ecl, int offset, int dest, int time = 0, int ecl_time = -1)
+    {
+        ecl.SetPos(offset);
+        ecl << (ecl_time == -1 ? 0 : ecl_time) << 0x00140004 << 0x0000ff00
+            << time << (dest - offset);
+    }
+    void ECLSetTime(ECLHelper& ecl, int offset, int32_t time, int32_t sub_id, int ecl_time = -1, bool stall = true)
+    {
+        ecl.SetPos(offset);
+        ecl << (ecl_time == -1 ? 0 : ecl_time) << 0x00140086 << 0x0000ff00
+            << time << sub_id;
+        if (stall)
+            ecl << 0x999999 << 0x000C0000 << 0x0000ff00;
+    }
+    void ECLSetHealth(ECLHelper& ecl, int offset, int32_t health, int ecl_time = -1, bool stall = true)
+    {
+        ecl.SetPos(offset);
+        ecl << (ecl_time == -1 ? 0 : ecl_time) << 0x00100083 << 0x0000ff00
+            << health;
+        if (stall)
+            ecl << 0x999999 << 0x000C0000 << 0x0000ff00;
+    }
+    void ECLCheckTime(int32_t time)
+    {
+        int32_t* pTime1 = (int32_t*)0x164cfb4;
+        int32_t* pTime2 = (int32_t*)GetMemAddr(0x160f510, 0x3c);
+        int32_t* pTime3 = (int32_t*)GetMemAddr(0x160f510, 0x44);
+        if (*pTime1 < time) {
+            *pTime1 = time;
+            *pTime2 = time;
+            *pTime3 = time;
+        }
+    }
+    void STDJump(int offset, int32_t ins_ord, int32_t time, int32_t ins_time = 0)
+    {
+        VFile std;
+        std.SetFile(*((void**)0x4E4824), 0x9999);
+        std.SetPos(offset);
+        std << ins_time << 0x000c0004 << ins_ord << time << 0;
+    }
+    void STDStage4Fix(bool isLastSpell = false)
+    {
+        VFile std;
+        std.SetFile(*((void**)0x4E4824), 0x9999);
+        std << pair{0xed8, 1} << pair{0xf14, 1};
+        if (isLastSpell) {
+            std.SetPos(0x1394);
+            std << 6926 << 0x000c001f << 2 << 0 << 0
+                << 6926 << 0x000c0004 << 1 << 0 << 0;
+            std.SetPos(0xf48);
+            std << 0 << 0x000c0004 << 70 << 6926 << 0;
+        }
+    }
+    void MSGNameFix()
+    {
+        th08_name_fix.Enable();
+    }
+    __declspec(noinline) void THStageWarp([[maybe_unused]] ECLHelper& ecl, int stage, int portion)
+    {
+        if (stage == 1) {
+            switch (portion) {
+            case 1:
+                ECLWarp(340, 0x9c38, 20, 0xad18);
+                break;
+            case 2:
+                ECLWarp(2875, 0xaba4, 20, 0xad18);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 2) {
+            switch (portion) {
+            case 1:
+                ECLWarp(400, 0xa194, 20, 0xc0cc);
+                break;
+            case 2:
+                ECLWarp(990, 0xa8d8, 20, 0xc0cc);
+                break;
+            case 3:
+                ECLWarp(2350, 0xb418, 20, 0xc0cc);
+                break;
+            case 4:
+                ECLWarp(3350, 0xba78, 20, 0xc0cc);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 3) {
+            switch (portion) {
+            case 1:
+                ECLWarp(340, 0xb258, 20, 0xb91c, 20, 0xbb74, 20, 0xc0ac);
+                break;
+            case 2:
+                ECLWarp(1220, 0xb368, 200, 0xba14, 20, 0xbb74, 20, 0xc0ac);
+                break;
+            case 3:
+                ECLWarp(3103, 0xb664, 380, 0xbacc, 20, 0xbb74, 160, 0xc304);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 4) {
+            switch (portion) {
+            case 1:
+                ECLWarp(340, 0xa2d4, 20, 0xbafc);
+                break;
+            case 2:
+                ECLWarp(1180, 0xa834, 20, 0xbafc);
+                break;
+            case 3:
+                ECLWarp(2240, 0xa8ac, 360, 0xbed4);
+                break;
+            case 4:
+                ECLWarp(3180, 0xabcc, 360, 0xbed4);
+                break;
+            case 5:
+                if (thPracParam.dlg){
+                    ECLWarp(4962, 0xb280, 360, 0xbed4);
+                    // ECLCallSub(ecl, 0x1870, 22, 60);//sub17
+                    ECLCallSub(ecl, 0x1758, 22, 60); // sub17
+                    STDJump(0xf48, 38, 4562);
+                    STDStage4Fix();
+                }else{
+                    STDJump(0xf48, 56, 6558);
+                    ECLWarp(4903, 0xb2d8, 360, 0xbed4);
+                }
+                break;
+            case 6:
+                ECLWarp(5363, 0xb598, 360, 0xbed4);
+                STDJump(0xf48, 56, 6558);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 5) {
+            switch (portion) {
+            case 1:
+                ECLWarp(340, 0xc538, 20, 0xdd80);
+                break;
+            case 2:
+                ECLWarp(1180, 0xcab8, 20, 0xdd80);
+                break;
+            case 3:
+                ECLWarp(2240, 0xcb30, 360, 0xe158);
+                break;
+            case 4:
+                ECLWarp(3180, 0xce50, 360, 0xe158);
+                break;
+            case 5:
+                if (thPracParam.dlg) {
+                    ECLWarp(4962, 0xd504, 360, 0xe158);
+                    ECLTimeFix(0x1814, 0, 5);
+                    //ECLCallSub(ecl, 0x18b4, 22, 60);
+                    ECLCallSub(ecl, 0x179C, 25, 60);
+                    STDStage4Fix();
+
+                    ECLSetTime(ecl, 0x2570, 0, 41, 0);
+                } else {
+                    ECLWarp(4903, 0xd55c, 360, 0xe158);
+                    STDJump(0xf48, 56, 6558);
+                }
+                break;
+            case 6:
+                ECLWarp(5363, 0xd81c, 360, 0xe158);
+                STDJump(0xf48, 56, 6558);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 6) {
+            switch (portion) {
+            case 1:
+                ECLWarp(200, 0xa674);
+                break;
+            case 2:
+                ECLWarp(1040, 0xa694);
+                break;
+            case 3:
+                ECLWarp(2990, 0xafdc);
+                break;
+            case 4:
+                ECLWarp(4651, 0xb0e8);
+                break;
+            case 5:
+                ECLWarp(5971, 0xb648);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 7) {
+            switch (portion) {
+            case 1:
+                ECLWarp(200, 0xc6f4);
+                break;
+            case 2:
+                ECLWarp(1140, 0xc714);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 8) {
+            switch (portion) {
+            case 1:
+                ECLWarp(200, 0x10324);
+                break;
+            case 2:
+                ECLWarp(1140, 0x10364);
+                break;
+            default:
+                break;
+            }
+        } else if (stage == 9) {
+            switch (portion) {
+            case 1:
+                ECLWarp(340, 0x12544, 20, 0x1535c);
+                break;
+            case 2:
+                ECLWarp(1010, 0x127a8, 210, 0x155c0);
+                break;
+            case 3:
+                ECLWarp(2900, 0x12b6c, 390, 0x15824);
+                break;
+            case 4:
+                ECLWarp(5237, 0x132b8, 810, 0x15d60);
+                break;
+            case 5:
+                ECLWarp(5947, 0x136b4, 20, 0x1535c);
+                break;
+            case 6:
+                ECLWarp(6757, 0x13774, 20, 0x1535c);
+                break;
+            case 7:
+                ECLWarp(8337, 0x151f4, 20, 0x1535c);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    __declspec(noinline) void THPatch(ECLHelper& ecl, th_sections_t section)
+    {
+        int32_t diff = *((int32_t*)0x160f538);
+        int32_t sub_id;
+
+        switch (section) {
+        case THPrac::TH08::TH08_ST1_MID1:
+            ECLWarp(2935, 0xab78, 20, 0xad18);
+            break;
+        case THPrac::TH08::TH08_ST1_MID2:
+            ECLWarp(2935, 0xab78, 20, 0xad18);
+            if (diff == 1 || diff == 2)
+                break;
+            ECLSetTime(ecl, 0x178c, 0, 22, 60);
+            break;
+        case THPrac::TH08::TH08_ST1_BOSS1:
+            if (thPracParam.dlg)
+                ECLWarp(4175, 0xac70, 0, -1);
+            else
+                ECLWarp(4175, 0xac84, 0, -1);
+            break;
+        case THPrac::TH08::TH08_ST1_BOSS2:
+            ECLWarp(4175, 0xac84, 0, -1);
+            ECLSetTime(ecl, 0x3d30, 0, 38, 60);
+            break;
+        case THPrac::TH08::TH08_ST1_BOSS3:
+            ECLWarp(4175, 0xac84, 0, -1);
+            ECLTimeFix(0x3c68, 0, 6);
+            ECLJump(ecl, 0x3d08, 0x4e0c, 0, 30);
+            break;
+        case THPrac::TH08::TH08_ST1_BOSS4:
+            ECLWarp(4175, 0xac84, 0, -1);
+            ECLTimeFix(0x3c68, 0, 6);
+            ECLCallSub(ecl, 0x3d08, 33, 60);
+            ECLTimeFix(0x4ed4, 0, 2);
+            ECLSetTime(ecl, 0x4ef0, 0, 44);
+            break;
+        case THPrac::TH08::TH08_ST1_LS:
+            ECLWarp(4176, 0xacd0, 0, -1);
+            ECLTimeFix(0x58d4, 0, 5);
+            ECLTimeFix(0x5944, 30, 6);
+            ecl << ECLX(0x5948, (int16_t)0);
+            ECLCheckTime(3000);
+            break;
+        case THPrac::TH08::TH08_ST2_MID1:
+            ECLWarp(4870, 0xc020, 0, -1);
+            ECLTimeFix(0x1ed8, 0, 7);
+            ECLTimeFix(0x1f98, 60, 3);
+            break;
+        case THPrac::TH08::TH08_ST2_MID2:
+            ECLWarp(4870, 0xc020, 0, -1);
+            ECLTimeFix(0x1ed8, 0, 7);
+            ECLTimeFix(0x1f98, 60, 3);
+
+            ECLSetTime(ecl, 0x22b0, 0, 23);
+            break;
+        case THPrac::TH08::TH08_ST2_BOSS1:
+            ECLWarp(4870, 0xc020, 0, -1);
+            if (thPracParam.dlg) {
+                // I spent about an hour trying to do this
+                // I am not exactly sure why this works I just took it from the SpoilerAL SSG
+                // But I at least documented what it does for anyone curious
+                ecl.SetPos(0x1e6c);
+                ecl << 0 << 22; // Sub17: timerThreshold(1980, 23) -> timerThreshold(0, 22)
+                ecl.SetPos(0x3784);
+                ecl << 0 << 29; // Sub27: timerThreshold(1920, 38) -> timerThreshold(0, 29)
+            } else {
+                ECLJump(ecl, 0x1e34, 0x1ea8);
+                ECLTimeFix(0x1ed8, 0, 7);
+                ECLCallSub(ecl, 0x1f98, 27, 60, true);
+                ECLJump(ecl, 0x37c0, 0x3880, 60);
+                ecl << ECLX(0xc026, (int8_t)0x50);
+            }
+            break;
+        case THPrac::TH08::TH08_ST2_BOSS2:
+            ECLWarp(4870, 0xc020, 0, -1);
+            ECLJump(ecl, 0x1e34, 0x1ea8);
+            ECLTimeFix(0x1ed8, 0, 7);
+            ECLCallSub(ecl, 0x1f98, 27, 60, true);
+            ECLJump(ecl, 0x37c0, 0x3880, 60);
+            ecl << ECLX(0xc026, (int8_t)0x50);
+            ECLSetTime(ecl, 0x389c, 0, (diff <= 1) ? 33 : 38, 60);
+            break;
+        case THPrac::TH08::TH08_ST2_BOSS3:
+            if (thPracParam.sp1_pts){
+                // ECLCallSub(ecl, 0x3d68, 51, 0);
+                ecl << std::pair { 0x1ebc+0x14, (float)thPracParam.bsX+192.0f };
+                ecl << std::pair { 0x1ebc+0x18, (float)thPracParam.bsY };
+                static DWORD code_cave[]  = {
+                          0x10, 0x00140007, 0x0003FF00, 0x461C8800,0x461CE800,// fset(%F2, %SELF_X);
+                          0x10, 0x00140007, 0x0003FF00, 0x461C8C00,0x461CEC00,// fset(%F3, %SELF_Y);
+
+                          0x10, 0x0018001B, 0x0003FF00, 0x461C8000, 0x461CCC00, 0x42700000, // fset_mul(%F0, %RANDF2, 60.0f);
+                          0x10, 0x0018001B, 0x0003FF00, 0x461C8400, 0x461CCC00, 0x42700000, // fset_mul(%F1, %RANDF2, 60.0f);
+                          0x10, 0x00180019, 0x0007FF00, 0x461C8000, 0x461C8000, 0x461C8800, // fset_add(%F0,%F0,%F2);
+                          0x10, 0x00180019, 0x0007FF00, 0x461C8400, 0x461C8400, 0x461C8C00, // fset_add(%F1,%F1,%F3);
+                          0x10, 0x0014003F, 0x0003FF00, 0x461C8000, 0x461C8400, // movePos(%F0,%F1);
+                          0x10, 0x0010008D, 0x0000FF00, 0x00000000, // dropItemId(0);
+
+                          0x10, 0x0018001B, 0x0003FF00, 0x461C8000, 0x461CCC00, 0x42700000, // fset_mul(%F0, %RANDF2, 60.0f);
+                          0x10, 0x0018001B, 0x0003FF00, 0x461C8400, 0x461CCC00, 0x42700000, // fset_mul(%F1, %RANDF2, 60.0f);
+                          0x10, 0x00180019, 0x0007FF00, 0x461C8000, 0x461C8000, 0x461C8800, // fset_add(%F0,%F0,%F2);
+                          0x10, 0x00180019, 0x0007FF00, 0x461C8400, 0x461C8400, 0x461C8C00, // fset_add(%F1,%F1,%F3);
+                          0x10, 0x0014003F, 0x0003FF00, 0x461C8000, 0x461C8400, // movePos(%F0,%F1);
+                          0x10, 0x0010008D, 0x0000FF00, 0x00000000, // dropItemId(0);
+
+                          0x10, 0x0018001B, 0x0003FF00, 0x461C8000, 0x461CCC00, 0x42700000, // fset_mul(%F0, %RANDF2, 60.0f);
+                          0x10, 0x0018001B, 0x0003FF00, 0x461C8400, 0x461CCC00, 0x42700000, // fset_mul(%F1, %RANDF2, 60.0f);
+                          0x10, 0x00180019, 0x0007FF00, 0x461C8000, 0x461C8000, 0x461C8800, // fset_add(%F0,%F0,%F2);
+                          0x10, 0x00180019, 0x0007FF00, 0x461C8400, 0x461C8400, 0x461C8C00, // fset_add(%F1,%F1,%F3);
+                          0x10, 0x0014003F, 0x0003FF00, 0x461C8000, 0x461C8400, // movePos(%F0,%F1);
+                          0x10, 0x0010008D, 0x0000FF00, 0x00000000, // dropItemId(0);
+
+                          0x10, 0x0014003F, 0x0003FF00, 0x461C8800,0x461C8C00, // movePos(%F2,%F3);
+                          
+                          0x10, 0x001000A8, 0x0000FF00, 5,//dropPointItems(5);
+                          //0x10, 0x00140086, 0x0000FF00, 0x000008E8,0x0000002C, //	timerThreshold(2280, 44);
+                          0x10, 0x001C004B, 0x0000FF00,0x42000000,0x42400000,0x43B00000,0x43000000,//moveLimit(32.0f, 48.0f, 352.0f, 128.0f);
+                          0x10, 0x00140004, 0x0000FF00, 10,0xABCD,              //	jmp(10, 0xABCD)
+                };
+                
+                ecl.SetPos(0x3E14);
+                __th08_ins_header* ins = (__th08_ins_header*)GetMemAddr(0x4ECCB8, 0x3E14);
+                ecl << 0x10 << 0x00140004 << 0x0000FF00 << 10 << ((DWORD)code_cave - (DWORD)ins);
+
+                int32_t t1 = (int32_t) & (code_cave[125]);
+                int32_t t2 = GetMemAddr(0x4ECCB8, 0x3e30);
+                *(int32_t*)(code_cave + 129) = t2 - t1;
+            }
+            ECLCallSub(ecl, 0x1ed8, 27, 0);
+            ECLTimeFix(0x1ed8, 0, 7);
+            ECLWarp(4870, 0xc020, 0, -1);
+            ECLTimeFix(0x1f98, 0, 3);
+            ecl << ECLX(0xc026, (int8_t)0x50) << ECLX(0x1f9c, (int16_t)0);
+
+            ECLTimeFix(0x37e0, 0, 5);
+            ECLCallSub(ecl, 0x389c, 29, 60);
+            break;
+        case THPrac::TH08::TH08_ST2_BOSS4:
+            ECLWarp(4870, 0xc020, 0, -1);
+            ECLTimeFix(0x1ed8, 0, 7);
+            ECLTimeFix(0x1f98, 0, 3);
+            ECLCallSub(ecl, 0x1ed8, 27, 0);
+            ecl << ECLX(0xc026, (int8_t)0x50) << ECLX(0x1f9c, (int16_t)0);
+
+            ECLTimeFix(0x37e0, 0, 5);
+            ECLCallSub(ecl, 0x389c, 29, 60);
+
+            ECLTimeFix(0x3e14, 0, 1);
+            ECLSetTime(ecl, 0x3e30, 0, 44, 0);
+            break;
+        case THPrac::TH08::TH08_ST2_BOSS5:
+            ECLWarp(4870, 0xc020, 0, -1);
+            ECLTimeFix(0x1ed8, 0, 7);
+            ECLTimeFix(0x1f98, 0, 3);
+            ECLCallSub(ecl, 0x1ed8, 27, 0);
+            ecl << ECLX(0xc026, (int8_t)0x50) << ECLX(0x1f9c, (int16_t)0);
+
+            ECLTimeFix(0x37e0, 0, 5);
+            ECLCallSub(ecl, 0x389c, 29, 60);
+
+            ECLTimeFix(0x3e14, 0, 1);
+            ECLSetTime(ecl, 0x3e30, 0, 51, 0);
+            ecl << ECLX(0x3db0, (int16_t)0) << ECLX(0x3da8, 51) << ECLX(0x7524, 0)
+                << ECLX(0x7508, (int16_t)0) << ECLX(0x7518, (int16_t)0);
+            break;
+        case THPrac::TH08::TH08_ST2_LS:
+            ECLWarp(4871, 0xc07c, 0, -1);
+            ECLTimeFix(0x49b0, 0, 5);
+            ECLTimeFix(0x4a20, 30, 6);
+            ecl << ECLX(0x4a24, (int16_t)0);
+            ECLCheckTime(7200);
+            break;
+        case THPrac::TH08::TH08_ST3_MID1:
+            ECLWarp(3080, 0xb5d8, 380, 0xbacc, 0, 0xbb74, 160, 0xc304);
+            ECLTimeFix(0x2380, 0, 6);
+            ECLTimeFix(0x2440, 60, 3);
+            break;
+        case THPrac::TH08::TH08_ST3_MID2:
+            ECLWarp(3080, 0xb5d8, 380, 0xbacc, 0, 0xbb74, 160, 0xc304);
+            ECLTimeFix(0x2380, 0, 6);
+            ECLTimeFix(0x2440, 60, 3);
+
+            ECLSetTime(ecl, 0x245c, 0, 30, 60);
+            ecl << ECLX(0xb5de, (int8_t)0x50);
+            break;
+        case THPrac::TH08::TH08_ST3_BOSS1:
+            ECLWarp(4663, 0xb87c, 0, -1, 0, -1, 0, -1);
+            if (!thPracParam.dlg)
+                ecl << ECLX(0xb882, (int8_t)0x2c);
+            break;
+        case THPrac::TH08::TH08_ST3_BOSS2:
+            ECLWarp(4663, 0xb87c, 0, -1, 0, -1, 0, -1);
+            ecl << ECLX(0xb882, (int8_t)0x2c);
+
+            if (!diff)
+                break;
+            ECLSetTime(ecl, 0x3f04, 0, 44, 60);
+            break;
+        case THPrac::TH08::TH08_ST3_BOSS3:
+            ECLWarp(4663, 0xb87c, 0, -1, 0, -1, 0, -1);
+            ecl << ECLX(0xb882, (int8_t)0x2c);
+
+            ECLSetTime(ecl, 0x3f04, 0, 47, 60);
+            ecl << ECLX(0x3ddc, (int16_t)0);
+            break;
+        case THPrac::TH08::TH08_ST3_BOSS4:
+            ECLWarp(4663, 0xb87c, 0, -1, 0, -1, 0, -1);
+            ecl << ECLX(0xb882, (int8_t)0x2c);
+            ECLCallSub(ecl, 0x3f04, 38, 60);
+            break;
+        case THPrac::TH08::TH08_ST3_BOSS5:
+            ECLWarp(4663, 0xb87c, 0, -1, 0, -1, 0, -1);
+            ecl << ECLX(0xb882, (int8_t)0x2c);
+            ECLCallSub(ecl, 0x3f04, 38, 60);
+
+            switch (diff) {
+            case 0:
+                sub_id = 50;
+                break;
+            case 1:
+                sub_id = 54;
+                break;
+            case 2:
+                sub_id = 58;
+                break;
+            case 3:
+                sub_id = 62;
+                break;
+            default:
+                sub_id = 75;
+            }
+            ECLSetTime(ecl, 0x4748, 0, sub_id);
+            ecl << ECLX(0x472c, 0);
+            break;
+        case THPrac::TH08::TH08_ST3_BOSS6:
+            ECLWarp(4663, 0xb87c, 0, -1, 0, -1, 0, -1);
+            ecl << ECLX(0xb882, (int8_t)0x2c);
+            ECLCallSub(ecl, 0x3f04, 38, 60);
+
+            ECLSetTime(ecl, 0x4748, 0, 67);
+            ECLJump(ecl, 0x462c, 0x46dc, 0, 0);
+            ECLJump(ecl, 0x3d80, 0x3df0, 0, 0);
+            ecl << ECLX(0x472c, 0);
+            break;
+        case THPrac::TH08::TH08_ST3_LS:
+            ECLWarp(4663, 0xb8cc, 0, -1, 0, -1, 0, -1);
+            ECLTimeFix(0x54bc, 0, 5);
+            ECLTimeFix(0x552c, 30, 6);
+            ecl << ECLX(0x5530, (int16_t)0);
+            ECLCheckTime(8800);
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS1:
+            if (thPracParam.dlg)
+                ECLWarp(4962, 0xb26c, 360, 0xbed4);
+            else
+                ECLWarp(4962, 0xb280, 360, 0xbed4);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS2:
+            ECLWarp(4962, 0xb280, 360, 0xbed4);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+
+            ECLSetTime(ecl, 0x188c, 0, 28, 60);
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS3:
+            ECLWarp(4962, 0xb280, 360, 0xbed4);
+            ECLTimeFix(0x17d0, 0, 6);
+            ECLCallSub(ecl, 0x1870, 19, 0);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS4:
+            ECLWarp(4962, 0xb280, 360, 0xbed4);
+            ECLCallSub(ecl, 0x1870, 19, 60);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+            
+            ECLSetTime(ecl, 0x22f0, 0, 30, 0);
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS5:
+            ECLWarp(6923, 0xba50, 0, -1);
+            ecl << pair{0x2e10, 0};
+            STDJump(0xf48, 56, 6558);
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS6:
+            ECLWarp(6923, 0xba50, 0, -1);
+            STDJump(0xf48, 56, 6558);
+
+            ECLSetTime(ecl, 0x2fa8, 0, 33, 0);
+            ecl << pair{0xba56, (int8_t)0x50};
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS7:
+            ECLWarp(6923, 0xba50, 0, -1);
+            ecl << pair{0x2e10, 0} << pair{0x2e1c, 26};
+            STDStage4Fix();
+            ecl << pair{0xba56, (int8_t)0x50};
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS8:
+            ECLWarp(6923, 0xba50, 0, -1);
+            ecl << pair{0x2e10, 0} << pair{0x2e1c, 26};
+            STDStage4Fix();
+            ecl << pair{0xba56, (int8_t)0x50};
+
+            ECLSetTime(ecl, 0x3850, 0, 41, 60);
+            ecl << pair{0x3764, (int16_t)0};
+            ecl << pair{0x3818, 60} << pair{0x3834, 60};
+            break;
+        case THPrac::TH08::TH08_ST4A_BOSS9:
+            ECLWarp(6923, 0xba50, 0, -1);
+            ecl << pair{0x2e10, 0} << pair{0x2e1c, 26};
+            STDStage4Fix();
+            ecl << pair{0xba56, (int8_t)0x50};
+
+            ECLCallSub(ecl, 0x3850, 45, 60);
+            ecl << pair{0x3818, 60} << pair{0x3834, 60};
+            ecl << pair{0x3764, (int16_t)0} << pair{0x37d4, (int16_t)0}
+                << pair{0x7d04, 0} << pair{0x7d10, 0}
+                << pair{0x7c68, (int16_t)0} << pair{0x7c78, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST4A_LS:
+            STDStage4Fix();
+            ECLWarp(6923, 0xbaac, 0, -1);
+            ECLTimeFix(0x4168, 0, 5);
+            ECLTimeFix(0x41d8, 30, 6);
+            ecl << ECLX(0x41dc, (int16_t)0);
+            ECLCheckTime(9999);
+
+            ecl.SetPos(0x41c0);
+            ecl << 0 << 0x00180093 << 0x0000ff00 << 2;
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS1:
+            if (thPracParam.dlg)
+                ECLWarp(4962, 0xd4f0, 360, 0xe158);
+            else
+                ECLWarp(4962, 0xd504, 360, 0xe158);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS2:
+            ECLWarp(4962, 0xd504, 360, 0xe158);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+
+            ECLSetTime(ecl, 0x18d0, 0, 36, 60);
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS3:
+            ECLWarp(4962, 0xd504, 360, 0xe158);
+            ECLTimeFix(0x1814, 0, 5);
+            ECLCallSub(ecl, 0x18b4, 22, 0);
+            ecl << pair{0x2554, 120} << pair{0x2570, 120};
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS4:
+            ECLWarp(4962, 0xd504, 360, 0xe158);
+            ECLTimeFix(0x1814, 0, 5);
+            ECLCallSub(ecl, 0x18b4, 22, 60);
+            STDJump(0xf48, 38, 4562);
+            STDStage4Fix();
+
+            ECLSetTime(ecl, 0x2570, 0, 41, 0);
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS5:
+            ECLWarp(6923, 0xdcd4, 0, -1);
+            ecl << pair{0x2f14, 0} << pair{0x3030, 120} << pair{0x304c, 120};
+            STDJump(0xf48, 56, 6558);
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS6:
+            ECLWarp(6923, 0xdcd4, 0, -1);
+            ecl << pair{0x2f14, 0} << pair{0x3030, 60};
+            STDJump(0xf48, 56, 6558);
+
+            ecl << pair{0xdcda, (int8_t)0x50};
+            ECLSetTime(ecl, 0x304c, 0, 47, 60);
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS7:
+            ECLWarp(6923, 0xdcd4, 0, -1);
+            ecl << pair{0xdcda, (int8_t)0x50};
+            ecl << pair{0x2f14, 0} << pair{0x2f20, 31}
+                << pair{0x38b8, 120} << pair{0x38d4, 120};
+            STDStage4Fix();
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS8:
+            ECLWarp(6923, 0xdcd4, 0, -1);
+            ecl << pair{0xdcda, (int8_t)0x50};
+            ecl << pair{0x2f14, 0} << pair{0x2f20, 31}
+                << pair{0x38b8, 120} << pair{0x38d4, 120};
+            STDStage4Fix();
+
+            ECLSetTime(ecl, 0x38d4, 0, 55, 60);
+            ecl << pair{0x38b8, 60};
+            break;
+        case THPrac::TH08::TH08_ST4B_BOSS9:
+            ECLWarp(6923, 0xdcd4, 0, -1);
+            ecl << pair{0xdcda, (int8_t)0x50};
+            ecl << pair{0x2f14, 0} << pair{0x2f20, 31};
+            STDStage4Fix();
+
+            ECLCallSub(ecl, 0x38d4, 61, 60);
+            ecl << pair{0x38b8, 60}
+                << pair{0x8b48, 0} << pair{0x8b54, 0} << pair{0x8b68, 0}
+                << pair{0x8aac, (int16_t)0} << pair{0x8abc, (int16_t)0}
+                << pair{0x3888, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST4B_LS:
+            STDStage4Fix();
+            ECLWarp(6923, 0xdd30, 0, -1);
+            ECLTimeFix(0x4374, 0, 5);
+            ECLTimeFix(0x43e4, 30, 6);
+            ecl << ECLX(0x43e8, (int16_t)0);
+            ECLCheckTime(8500);
+
+            ecl.SetPos(0x43cc);
+            ecl << 0 << 0x00180093 << 0x0000ff00 << 2;
+            break;
+        case THPrac::TH08::TH08_ST5_MID1:
+            ECLWarp(4530, 0xb0bc);
+            ECLTimeFix(0x3704, 0, 6);
+            ECLTimeFix(0x37c4, 60, 3);
+            break;
+        case THPrac::TH08::TH08_ST5_MID2:
+            ECLWarp(4530, 0xb0bc);
+            ECLTimeFix(0x3704, 0, 9);
+            ecl << pair{0x37c8, (int16_t)0} << pair{0x37ec, 45};
+            ECLJump(ecl, 0x4360, 0x437c, 119, 0);
+            ECLTimeFix(0x437c, 120, 4);
+            ECLSetHealth(ecl, 0x37e0, 0, 1);
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS1:
+            MSGNameFix();
+            if (thPracParam.dlg)
+                ECLWarp(7481, 0xb788);
+            else {
+                ECLWarp(7481, 0xb79c);
+                ecl << pair{0xb7a2, (int8_t)0x78};
+                ECLCallSub(ecl, 0x4c6c, 51);
+            }
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS2:
+            MSGNameFix();
+            ECLWarp(7481, 0xb79c);
+            ecl << pair{0xb7a2, (int8_t)0x78};
+            ECLCallSub(ecl, 0x4c6c, 51);
+
+            ECLSetTime(ecl, 0x4f78, 0, 62, 60);
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS3:
+            MSGNameFix();
+            ECLWarp(7481, 0xb79c);
+            ecl << pair{0xb7a2, (int8_t)0x78};
+            ECLCallSub(ecl, 0x4c6c, 51);
+            ECLTimeFix(0x4ebc, 0, 5);
+            ECLCallSub(ecl, 0x4f5c, 53, 0);
+            ECLTimeFix(0x5214, 60, 9);
+            ecl << pair{0x52cc, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS4:
+            MSGNameFix();
+            ECLWarp(7481, 0xb79c);
+            ecl << pair{0xb7a2, (int8_t)0x78};
+            ECLCallSub(ecl, 0x4c6c, 51);
+            ECLTimeFix(0x4ebc, 0, 5);
+            ECLCallSub(ecl, 0x4f5c, 53, 0);
+            ECLTimeFix(0x5214, 60, 9);
+            ecl << pair{0x52cc, (int16_t)0};
+
+            ECLSetTime(ecl, 0x52d8, 0, 66, 60);
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS5:
+            MSGNameFix();
+            ECLWarp(7481, 0xb79c);
+            ecl << pair{0xb7a2, (int8_t)0x78};
+            ECLCallSub(ecl, 0x4c6c, 51);
+            ECLTimeFix(0x4ebc, 0, 5);
+            ECLCallSub(ecl, 0x4f5c, 56, 0);
+            ECLTimeFix(0x5744, 60, 11);
+            ecl << pair{0x5830, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS6:
+            MSGNameFix();
+            ECLWarp(7481, 0xb79c);
+            ecl << pair{0xb7a2, (int8_t)0x78};
+            ECLCallSub(ecl, 0x4c6c, 51);
+            ECLTimeFix(0x4ebc, 0, 5);
+            ECLCallSub(ecl, 0x4f5c, 56, 0);
+            ECLTimeFix(0x5744, 60, 11);
+            ecl << pair{0x5830, (int16_t)0};
+
+            ECLSetTime(ecl, 0x583c, 0, 63, 60);
+            break;
+        case THPrac::TH08::TH08_ST5_BOSS7:
+            MSGNameFix();
+            ECLWarp(7481, 0xb79c);
+            ecl << pair{0xb7a2, (int8_t)0x78};
+            ECLCallSub(ecl, 0x4c6c, 51);
+            ECLTimeFix(0x4ebc, 0, 5);
+            ECLCallSub(ecl, 0x4f5c, 56, 0);
+            ECLTimeFix(0x5744, 60, 11);
+            ecl << pair{0x5830, (int16_t)0};
+
+            ECLSetTime(ecl, 0x583c, 0, 75, 60);
+            ecl << pair{0x5798, (int16_t)0} << pair{0x57b8, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST5_LS:
+            MSGNameFix();
+            ECLWarp(7484, 0xb820);
+            ECLTimeFix(0x5e24, 0, 5);
+            ECLTimeFix(0x5e94, 30, 6);
+            ecl << ECLX(0x5e98, (int16_t)0);
+            ECLCheckTime(9999);
+            break;
+        case THPrac::TH08::TH08_ST6A_MID1:
+            ECLWarp(3400, 0xc7d4);
+            if (!thPracParam.dlg) {
+                ecl << pair{0xc7da, (int8_t)0x44};
+                ECLTimeFix(0x1de4, 0, 6);
+                ecl << pair{0x1ea4, 60} << pair{0x1dd4, (int16_t)0};
+                ECLJump(ecl, 0x1ec0, 0x1ee0, 0, 60);
+            }
+            break;
+        case THPrac::TH08::TH08_ST6A_MID2:
+            ECLWarp(3400, 0xc7d4);
+            ecl << pair{0xc7da, (int8_t)0x44};
+            ECLTimeFix(0x1de4, 0, 6);
+            ecl << pair{0x1ea4, 60} << pair{0x1dd4, (int16_t)0};
+            ECLJump(ecl, 0x1ec0, 0x1ee0, 0, 60);
+
+            ECLSetTime(ecl, 0x1fdc, 0, 21);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS1:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            if (thPracParam.dlg)
+                ECLWarp(4022, 0xc824);
+            else {
+                ECLWarp(4022, 0xc838);
+                ecl << pair{0xc83e, (int8_t)0x38};
+                ECLCallSub(ecl, 0x367c, 33);
+            }
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS2:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+
+            ECLSetTime(ecl, 0x3de4, 0, 52, 60);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS3:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 36);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x454c, 60, 8);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS4:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 36);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x454c, 60, 8);
+
+            ECLSetTime(ecl, 0x4600, 0, 56, 60);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS5:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 40);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x4c98, 60, 8);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS6:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 40);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x4c98, 60, 8);
+
+            ECLSetTime(ecl, 0x4d4c, 0, 63, 60);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS7:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 44);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x5534, 60, 8);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS8:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 44);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x5534, 60, 8);
+
+            ECLSetTime(ecl, 0x55e8, 0, 68, 60);
+            break;
+        case THPrac::TH08::TH08_ST6A_BOSS9:
+            MSGNameFix();
+            ECLWarp(4022, 0xc838);
+            ecl << pair{0xc83e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x367c, 33);
+            ECLCallSub(ecl, 0x3dc8, 72);
+            ECLTimeFix(0x3d28, 0, 6);
+            ECLTimeFix(0x9a44, 60, 6);
+            ecl << pair{0x3cd8, (int16_t)0}
+                << pair{0x99f8, (int16_t)0} << pair{0x9a08, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST6A_LS:
+            MSGNameFix();
+            ECLWarp(4083, 0xc89c);
+            ecl << pair{0xc8a2, (int8_t)0x44};
+
+            ECLCallSub(ecl, 0x376c, 30);
+            ecl << pair { 0x37A4, (int16_t)0 } << pair { 0x3928, (int16_t)0 };//disable setBoss(-1) to avoid countdown disappear
+
+            ecl << pair{0x3760, (int16_t)0} << pair{0x3918, (int16_t)0}
+                << pair{0x3938, (int16_t)0};
+            ecl << pair{0xc8e0, 4084} << pair{0xc900, 4084}
+                << pair{0xc90c, 4084} << pair{0xc918, 4084};
+            
+            switch (thPracParam.phase) {
+            case 0:
+                break;
+            case 1:
+                ecl << pair { 0xB2A4, (int16_t)0 }; // et_cancel
+                ecl << pair { 0xAC6C, 5940 - (920-260) }; // time
+                ECLJump(ecl, 0xB244, 0xB264, 920, 260);
+                break;
+            case 2:
+                ecl << pair { 0xB2FC, (int16_t)0 }; // et_cancel
+                ecl << pair { 0xAC6C, 5940 - (2920 - 260) };
+                ECLJump(ecl, 0xB244, 0xB2BC, 2920, 260);
+                break;
+            case 3:
+                ecl << pair { 0xB2FC, (int16_t)0 }; // et_cancel
+                ecl << pair { 0xAC6C, (5940 - (2920 - 260 + (60 + 38) * 12 / 2 + 260 ))  };
+                ECLJump(ecl, 0xB244, 0xB2BC, 2920, 260);
+                ECLJump(ecl, 0xBEC8, 0xC064, 260, 0);
+                break;
+            case 4:
+                ecl << pair { 0xB2FC, (int16_t)0 }; //et_cancel
+                ecl << pair { 0xAC6C, (5940 - (2920 - 260 + (60 + 38) * 12 / 2 + (80 + 26) * 10 / 2 + 260  + 200 ))  };
+                ECLJump(ecl, 0xB244, 0xB2BC, 2920, 260);
+                ECLJump(ecl, 0xBEC8, 0xC228, 460, 0);
+                break;
+            case 5:
+                ecl << pair { 0xB2FC, (int16_t)0 }; // et_cancel
+                ecl << pair { 0xAC6C, (5940 - (2920 - 260 + (60 + 38) * 12 / 2 + (80 + 26) * 10 / 2 + 260 + 200 + (100+20)*17 / 2)) };
+                // use L case(first interval=100, then decrease 5 eachtime till 15)
+                ECLJump(ecl, 0xB244, 0xB2BC, 2920, 260);
+                ECLJump(ecl, 0xBEC8, 0xC228, 460, 0);
+                ecl << pair { 0xC274, (int32_t)15 }; // rage
+                ecl << pair { 0xC288, (int32_t)15 }; // rage
+                ecl << pair { 0xC29C, (int32_t)15 }; // rage
+                ecl << pair { 0xC2B0, (int32_t)15 }; // rage
+                break;
+            default:
+                break;
+            }
+
+            break;
+        case THPrac::TH08::TH08_ST6B_MID1:
+            ECLWarp(3490, 0x104e4);
+            if (!thPracParam.dlg) {
+                ecl << pair{0x104ea, (int8_t)0x44};
+                ECLTimeFix(0x1bfc, 0, 6);
+                ecl << pair{0x1cbc, 60} << pair{0x1bec, (int16_t)0};
+                ECLCallSub(ecl, 0x1cd8, 15, 60);
+            }
+            break;
+        case THPrac::TH08::TH08_ST6B_MID2:
+            ECLWarp(3490, 0x104e4);
+            ecl << pair{0x104ea, (int8_t)0x44};
+            ECLTimeFix(0x1bfc, 0, 6);
+            ecl << pair{0x1cbc, 60} << pair{0x1bec, (int16_t)0};
+            ECLCallSub(ecl, 0x1cd8, 15, 60);
+
+            ECLSetTime(ecl, 0x1df4, 0, 19);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS1:
+            *((int32_t*)0x4ea290) = 1;
+            if (thPracParam.dlg) {
+                ECLWarp(4112, 0x10534);
+            } else {
+                MSGNameFix();
+                ECLWarp(4112, 0x10548);
+                ecl << pair{0x1054e, (int8_t)0x38};
+                ECLCallSub(ecl, 0x3a28, 27);
+            }
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS2:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLSetTime(ecl, 0x3c24, 0, 50, 60);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS3:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 31);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0x4370, 60, 8);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS4:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 31);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0x4370, 60, 8);
+
+            ECLSetTime(ecl, 0x4424, 0, 55, 60);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS5:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 34);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0x4c14, 60, 9);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS6:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 34);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0x4c14, 60, 9);
+
+            ECLSetTime(ecl, 0x4cec, 0, 61, 60);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS7:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 38);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0x5570, 60, 8);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS8:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 38);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0x5570, 60, 8);
+
+            ECLSetTime(ecl, 0x5624, 0, 67, 60);
+            break;
+        case THPrac::TH08::TH08_ST6B_BOSS9:
+            MSGNameFix();
+            ECLWarp(4112, 0x10548);
+            ecl << pair{0x1054e, (int8_t)0x38};
+            ECLCallSub(ecl, 0x3a28, 27);
+
+            ECLCallSub(ecl, 0x3c08, 70);
+            ECLTimeFix(0x3b68, 0, 6);
+            ECLTimeFix(0xa920, 60, 7);
+            ecl << pair{0x3b18, (int16_t)0}
+                << pair{0xa8e4, (int16_t)0} << pair{0xa8d4, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST6B_LS1:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4234, 0x105ac);
+            break;
+        case THPrac::TH08::TH08_ST6B_LS2:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4235, 0x105ec);
+            break;
+        case THPrac::TH08::TH08_ST6B_LS3:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4236, 0x1062c);
+            break;
+        case THPrac::TH08::TH08_ST6B_LS4:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4237, 0x1066c);
+            break;
+        case THPrac::TH08::TH08_ST6B_LS5:
+            *((int32_t*)0x4ea290) = 1;
+            MSGNameFix();
+            ECLWarp(4238, 0x106ac);
+            break;
+        case THPrac::TH08::TH08_ST7_MID1:
+            ECLWarp(5155, 0x13268, 810, 0x15d60);
+            if (!thPracParam.dlg) {
+                ecl << pair{0x1326e, (int8_t)0x44} << pair{0x3e10, 60};
+                ECLTimeFix(0x3d50, 0, 6);
+                ECLCallSub(ecl, 0x3e2c, 51, 60);
+            }
+            break;
+        case THPrac::TH08::TH08_ST7_MID2:
+            ECLWarp(5155, 0x13268, 810, 0x15d60);
+            ecl << pair{0x1326e, (int8_t)0x44};
+            ECLTimeFix(0x3d50, 0, 6);
+            ECLCallSub(ecl, 0x3e10, 55);
+            ECLTimeFix(0x4b34, 60, 6);
+            break;
+        case THPrac::TH08::TH08_ST7_MID3:
+            ECLWarp(5155, 0x13268, 810, 0x15d60);
+            ecl << pair{0x1326e, (int8_t)0x44};
+            ECLTimeFix(0x3d50, 0, 6);
+            ECLCallSub(ecl, 0x3e10, 59);
+            ECLTimeFix(0x5418, 60, 6);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS1:
+            if (thPracParam.dlg)
+                ECLWarp(9497, 0x152b4, 0, -1);
+            else {
+                ECLWarp(9497, 0x152c8, 0, -1);
+                MSGNameFix();
+                ecl << pair{0x152ce, (int8_t)0x38};
+                ECLCallSub(ecl, 0x65c4, 66);
+            }
+            break;
+        case THPrac::TH08::TH08_ST7_END_S1:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+
+            ECLSetTime(ecl, 0x67b0, 0, 93, 60);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS2:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 68, 60);
+            ecl << pair{0x6aac, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST7_END_S2:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 68, 60);
+            ecl << pair{0x6aac, (int16_t)0};
+
+            ECLSetTime(ecl, 0x6b9c, 0, 97);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS3:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 70, 60);
+            ecl << pair{0x6e74, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST7_END_S3:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 70, 60);
+            ecl << pair{0x6e74, (int16_t)0};
+
+            ECLSetTime(ecl, 0x6f64, 0, 100);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS4:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 72, 60);
+            ecl << pair{0x724c, (int16_t)0};
+            ecl << pair{0x71dc, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST7_END_S4:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 72, 60);
+            ecl << pair{0x724c, (int16_t)0};
+            ecl << pair{0x71dc, (int16_t)0};
+
+            ECLSetTime(ecl, 0x733c, 0, 103);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS5:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 74, 60);
+            ecl << pair{0x7548, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST7_END_S5:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 74, 60);
+            ecl << pair{0x7548, (int16_t)0};
+
+            ECLSetTime(ecl, 0x7638, 0, 108);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS6:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ECLTimeFix(0x66f4, 0, 5);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x6794, 76, 0);
+            ecl << pair{0x7844, (int16_t)0};
+            ECLTimeFix(0x7810, 60, 15);
+            break;
+        case THPrac::TH08::TH08_ST7_END_S6:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ECLTimeFix(0x66f4, 0, 5);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x6794, 76, 0);
+            ecl << pair{0x7844, (int16_t)0};
+            ECLTimeFix(0x7810, 60, 15);
+
+            ECLSetTime(ecl, 0x7944, 0, 113, 60);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS7:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ECLTimeFix(0x66f4, 0, 5);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x6794, 78, 0);
+            ecl << pair{0x7bcc, (int16_t)0};
+            ECLTimeFix(0x7b98, 60, 15);
+            break;
+        case THPrac::TH08::TH08_ST7_END_S7:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ECLTimeFix(0x66f4, 0, 5);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x6794, 78, 0);
+            ecl << pair{0x7bcc, (int16_t)0};
+            ECLTimeFix(0x7b98, 60, 15);
+
+            ECLSetTime(ecl, 0x7ccc, 0, 118, 60);
+            break;
+        case THPrac::TH08::TH08_ST7_END_NS8:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ECLTimeFix(0x66f4, 0, 5);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x6794, 80, 0);
+            ecl << pair{0x7f44, (int16_t)0};
+            ECLTimeFix(0x7f10, 60, 15);
+            break;
+        case THPrac::TH08::TH08_ST7_END_S8:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ECLTimeFix(0x66f4, 0, 5);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x6794, 80, 0);
+            ecl << pair{0x7f44, (int16_t)0};
+            ECLTimeFix(0x7f10, 60, 15);
+
+            ECLSetTime(ecl, 0x8044, 0, 126, 60);
+            break;
+        case THPrac::TH08::TH08_ST7_END_S9:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ECLCallSub(ecl, 0x67b0, 82, 60);
+
+            ECLJump(ecl, 0x95f4, 0x98c4, 10);
+            ECLJump(ecl, 0x98dc, 0x9910, 130, 10);
+            break;
+        case THPrac::TH08::TH08_ST7_END_S10:
+            MSGNameFix();
+            ECLWarp(9497, 0x152c8, 0, -1);
+            ecl << pair{0x152ce, (int8_t)0x38};
+            ECLCallSub(ecl, 0x65c4, 66);
+            ecl << pair{0x66a4, (int16_t)0};
+            ecl.SetPos(0x67b0);
+            ecl << 60 << 0x0014004e << 0x0000ff00 << 0x43800000 << 0x42000000;
+            ECLCallSub(ecl, 0x67c4, 83, 60);
+            ecl << pair{0x8408, (int16_t)0};
+            break;
+        case THPrac::TH08::TH08_ST7_END_LS: { // Imperishable Shooting
+            constexpr unsigned int st7TLPreLSTime = 9678;
+            constexpr unsigned int st7TLPreLS = 0x1530c;
+            constexpr unsigned int st7BossSp11PreTimeCheck = 0x851c;
+            constexpr unsigned int st7BossSp11PostTimeCheck = 0x8544;
+
+            constexpr unsigned int st7BossSp11TimerThreshold = 0x0fc88;
+            constexpr unsigned int st7BossSp11Wave1Particles = 0x0fe74;
+            constexpr unsigned int st7BossSp11Wave1ShotColor = 0x0fec0;
+            constexpr unsigned int st7BossSp11Wave1PostColor = 0x0fed4;
+
+            constexpr unsigned int st7BossSp11Wave2Start = 0xff0c;
+            constexpr unsigned int st7BossSp11Wave3Start = 0x10050;
+            constexpr unsigned int st7BossSp11Wave4Start = 0x101f0;
+            constexpr unsigned int st7BossSp11Wave5Start = 0x104fc;
+            constexpr unsigned int st7BossSp11Wave6Start = 0x10a10;
+            constexpr unsigned int st7BossSp11Wave7Start = 0x10d1c;
+
+            MSGNameFix();
+            ECLWarp(st7TLPreLSTime, st7TLPreLS, 0, -1);
+            ECLJump(ecl, st7BossSp11PreTimeCheck, st7BossSp11PostTimeCheck);
+            if (!thPracParam.phase)
+                break;
+            ecl << pair { st7BossSp11Wave1Particles + ECL_INS_OPCODE, (int16_t)0 }; // NOP wave1 particles
+            // Note: each particles call (sub152) is 32f counted for seconds timer but not ECL time; we deduct skipped ones from threshold
+
+            switch (thPracParam.phase) {
+            case 1: // two circles (69s left)
+                ECLJump(ecl, st7BossSp11Wave1PostColor, st7BossSp11Wave2Start, 540, 90); // (skip 540-90 = 450f)
+                ecl << pair { st7BossSp11TimerThreshold + ECL_INS_ARG1, (int16_t)4258 }; // (base 4740f - 450f - 1 * 32f)
+                break;
+
+            case 2: // triangular circles (61s left)
+                ECLJump(ecl, st7BossSp11Wave1PostColor, st7BossSp11Wave3Start, 1000, 90); // (skip 1000-90 = 910f)
+                ecl << pair { st7BossSp11TimerThreshold + ECL_INS_ARG1, (int16_t)3798 } // (base 4740f - 910f - 1 * 32f)
+                    << pair { st7BossSp11Wave1ShotColor + ECL_INS_ARG2, 2 }; // (red)
+                break;
+
+            case 3: // line of circles (52s left)
+                ECLJump(ecl, st7BossSp11Wave1PostColor, st7BossSp11Wave4Start, 1460, 90); // (skip 1460-90 = 1370f)
+                ecl << pair { st7BossSp11TimerThreshold + ECL_INS_ARG1, (int16_t)3306 }; // (base 4740f - 1370f - 2 * 32f)
+                break;
+
+            case 4: // thick circles (36s left)
+                ECLJump(ecl, st7BossSp11Wave1PostColor, st7BossSp11Wave5Start, 2280, 90); // (skip 2280-90 = 2190f)
+                ecl << pair { st7BossSp11TimerThreshold + ECL_INS_ARG1, (int16_t)2326 } // (base 4740f - 2190f - 7 * 32f)
+                    << pair { st7BossSp11Wave1ShotColor + ECL_INS_ARG2, 2 }; // (red)
+                break;
+
+            case 5: // green rice circle (22s left)
+                ECLJump(ecl, st7BossSp11Wave1PostColor, st7BossSp11Wave6Start, 3040, 90); // (skip 3040-90 = 2950f)
+                ecl << pair { st7BossSp11TimerThreshold + ECL_INS_ARG1, (int16_t)1502 }; // (base 4740f - 2950f - 9 * 32f)
+                break;
+
+            case 6: // finale (14s left)
+                ECLJump(ecl, st7BossSp11Wave1PostColor, st7BossSp11Wave7Start, 3410, 90); // (skip 3410-90 = 3320f)
+                ecl << pair { st7BossSp11TimerThreshold + ECL_INS_ARG1, (int16_t)1020 }; // (base 4740f - 3320f - 10 * 32f - 5 * 16f) (phase 6 green shooter subs cost 16f)
+                break;
+            }
+
+            break;
+        }
+
+        case THPrac::TH08::TH08_LW_1:
+        case THPrac::TH08::TH08_LW_2:
+        case THPrac::TH08::TH08_LW_3:
+        case THPrac::TH08::TH08_LW_4:
+        case THPrac::TH08::TH08_LW_5:
+        case THPrac::TH08::TH08_LW_6:
+        case THPrac::TH08::TH08_LW_7:
+        case THPrac::TH08::TH08_LW_8:
+        case THPrac::TH08::TH08_LW_9:
+        case THPrac::TH08::TH08_LW_10:
+        case THPrac::TH08::TH08_LW_11:
+        case THPrac::TH08::TH08_LW_12:
+        case THPrac::TH08::TH08_LW_13:
+        case THPrac::TH08::TH08_LW_14:
+        case THPrac::TH08::TH08_LW_15:
+        case THPrac::TH08::TH08_LW_16:
+        case THPrac::TH08::TH08_LW_17:
+            break;
+        default:
+            break;
+        }
+    }
+    __declspec(noinline) void THSectionPatch()
+    {
+        ECLHelper ecl;
+        ecl.SetBaseAddr((void*)GetMemAddr(0x4ECCB8));
+
+        auto section = thPracParam.section;
+        if (section >= 10000 && section < 20000) {
+            int stage = (section - 10000) / 100;
+            int portionId = (section - 10000) % 100;
+            THStageWarp(ecl, stage, portionId);
+            THStage4ANM();
+        } else {
+            THPatch(ecl, (th_sections_t)section);
+            THStage4ANM();
+        }
+    }
+
+    void THSetPoint()
+    {
+        int32_t pPointFunc = 0x440470;
+        int32_t* point_stage = (int32_t*)GetMemAddr(0x160f510, 0x2c);
+        int32_t* point_total_1 = (int32_t*)GetMemAddr(0x160f510, 0x30);
+        int32_t* point_total_2 = (int32_t*)0x164cf9c;
+        if (thPracParam.point) {
+            *point_stage = *point_total_1 = *point_total_2 = thPracParam.point;
+        } else {
+            *point_stage = thPracParam.point_stage;
+            *point_total_1 = *point_total_2 = thPracParam.point_total;
+        }
+
+        int32_t temp = 0;
+        int32_t* award = (int32_t*)GetMemAddr(0x160f510, 0x34);
+        while (true) {
+            __asm
+                {
+                    pushad
+                    call pPointFunc
+                    popad
+                }
+            temp = (int32_t)GetMemContent(0x160f510, 0x38);
+            if (*point_total_1 < temp)
+                break;
+            (*award)++;
+        }
+    }
+    bool THBGMTest()
+    {
+        if (!thPracParam.mode)
+            return 0;
+        else if (thPracParam.section >= 10000) {
+            int stage = (thPracParam.section - 10000) / 100;
+            int portionId = (thPracParam.section - 10000) % 100;
+            if ((stage == 4 || stage == 5) && portionId > 4) {
+                return 1;
+            } else {
+                return 0;
+            }
+        } else if (thPracParam.dlg)
+            return 0;
+        else
+            return th_sections_bgm[thPracParam.section];
+    }
+    void THSaveReplay(char* rep_name)
+    {
+        ReplaySaveParam(mb_to_utf16(rep_name, 932).c_str(), thPracParam.GetJson());
+    }
+
+    void RenderBtHitbox(ImDrawList* p)
+    {
+        // show bullet hitbox
+        if (g_show_bullet_hitbox) {
+            DWORD mode = *(DWORD*)(0x164D0B4);
+            if (((mode & 0x1) || (mode & 0x8)) && (GetMemContent(GAMEMODE_ADDR) == 2)) {
+                p->PushClipRect({ 32.0f, 16.0f }, { 416.0f, 464.0f });
+
+                ImVec2 plpos1 = *(ImVec2*)(0x017D6284);
+                ImVec2 plpos2 = *(ImVec2*)(0x017D6290);
+                float plhit = plpos2.x - plpos1.x;
+                ImVec2 stage_pos = { 32.0f, 16.0f };
+
+                // bullet
+                for (int i = 0; i < 0x600; i++) {
+                    DWORD pbt = 0x00F54E90 + 0x1A880 + i * 0x10B8;
+                    if (*(WORD*)(pbt + 0xD88) == 0)
+                        continue;
+                    ImVec2 pos = *(ImVec2*)(pbt + 0xD44);
+                    ImVec2 hit = *(ImVec2*)(pbt + 0xD34);
+
+                    ImVec2 p1 = { pos.x - hit.x * 0.5f - plhit * 0.5f + stage_pos.x, pos.y - hit.y * 0.5f - plhit * 0.5f + stage_pos.y };
+                    ImVec2 p2 = { pos.x + hit.x * 0.5f + plhit * 0.5f + stage_pos.x, pos.y + hit.y * 0.5f + plhit * 0.5f + stage_pos.y };
+                    p->AddRectFilled(p1, p2, 0x88002288);
+                    p->AddRect(p1, p2, 0xFFFFFFFF, 0.0f);
+                }
+                // laser hitbox
+                for (int i = 0; i < 256; i++) {
+                    DWORD pls = 0x015B57C8 + 0x59C * i;
+                    DWORD is_used = *(DWORD*)(pls + 0x584);
+                    if (is_used) {
+                        ImVec2 pos = *(ImVec2*)(pls + 0x548);
+                        float angle = *(float*)(pls + 0x554);
+                        float quat_width = *(float*)(pls + 0x564) * 0.5f * 0.5f;
+                        float half_width_pl = plhit * 0.5f;
+                        float start_ofs = *(float*)(pls + 0x558);
+                        float end_ofs = *(float*)(pls + 0x55C);
+                        if (start_ofs < 0.0f) {
+                            float mid = (start_ofs + end_ofs) * 0.5f;
+                            float l2 = (start_ofs - end_ofs) * 0.7f * 0.5f;
+                            start_ofs = mid - l2;
+                            end_ofs = mid + l2;
+                        }
+                        int state = *(DWORD*)(pls + 0x598);
+
+                        int start_time_graze = *(DWORD*)(pls + 0x574);
+                        int end_time_graze = *(DWORD*)(pls + 0x580);
+                        int time_cur_state = *(DWORD*)(pls + 0x590);
+                        float sub_frame = *(float*)(pls + 0x58C);
+                        if (state == 0) {
+                            int state_change_time_hit = *(DWORD*)(pls + 0x570);
+                            float l2 = 0.0f;
+                            if (time_cur_state <= state_change_time_hit - std::max(30, state_change_time_hit)) {
+                                l2 = 1.2f * 0.5f;
+                            } else {
+                                l2 = quat_width * ((float)time_cur_state + sub_frame) / (float)state_change_time_hit;
+                            }
+                            float mid = (start_ofs + end_ofs) * 0.5f;
+                            start_ofs = mid - l2;
+                            end_ofs = mid + l2;
+                        }
+                        if (state == 2) {
+                            int state_change_time_disappear = *(DWORD*)(pls + 0x57C);
+                            float l2 = 0.0f;
+                            if (state_change_time_disappear > 0) {
+                                l2 = quat_width - quat_width * ((float)time_cur_state + sub_frame) / (float)state_change_time_disappear;
+                            }
+                            float mid = (start_ofs + end_ofs) * 0.5f;
+                            start_ofs = mid - l2;
+                            end_ofs = mid + l2;
+                        }
+                        if (state == 1 || (state == 0 && time_cur_state >= start_time_graze) || (state == 2 && time_cur_state < end_time_graze)) {
+                            float c = cosf(angle);
+                            float s = sinf(angle);
+                            ImVec2 hitpos[4] = {
+                                { start_ofs - half_width_pl, -quat_width - half_width_pl },
+                                { end_ofs + half_width_pl, -quat_width - half_width_pl },
+                                { end_ofs + half_width_pl, quat_width + half_width_pl },
+                                { start_ofs - half_width_pl, quat_width + half_width_pl }
+                            };
+                            auto RotPos = [](ImVec2 p, float c, float s) -> ImVec2 {
+                                return { p.x * c - p.y * s, p.x * s + p.y * c };
+                            };
+                            for (int j = 0; j < 4; j++) {
+                                hitpos[j] = RotPos(hitpos[j], c, s);
+                                hitpos[j].x += pos.x + stage_pos.x;
+                                hitpos[j].y += pos.y + stage_pos.y;
+                            }
+                            p->AddQuad(hitpos[0], hitpos[1], hitpos[2], hitpos[3], 0xFFFFFF00);
+                            p->AddQuadFilled(hitpos[0], hitpos[1], hitpos[2], hitpos[3], 0x88002288);
+                        }
+                    }
+                }
+                p->PopClipRect();
+            }
+        }
+    }
+    void RenderLockTimer(ImDrawList* p)
+    {
+        if (g_adv_igi_options.enable_lock_timer_autoly && *THOverlay::singleton().mTimeLock) {
+            std::string time_text = std::format("{:.2f}", (float)g_lock_timer / 60.0f);
+            auto sz = ImGui::CalcTextSize(time_text.c_str());
+            p->AddRectFilled({ 32.0f, 0.0f }, { 110.0f, sz.y }, 0xFFFFFFFF);
+            p->AddText({ 110.0f - sz.x, 0.0f }, 0xFF000000, time_text.c_str());
+        }
+    }
+
+
+    EHOOK_ST(th08_familiar, 0x42a55f, 3, {
+        uint32_t target = *(uint32_t*)(pCtx->Ebp - 8);
+        if (target == 0x57d2f0) {
+            if (thPracParam.mode && thPracParam.familiar) {
+                int32_t* familiar = (int32_t*)GetMemAddr(0x580670);
+                *familiar = thPracParam.familiar;
+            }
+            self->Disable();
+        }
+    });
+
+    // Native capture bridge: only canonical ECL attack roots are recorded.
+    static BossCaptureContext CaptureNativeContext()
+    {
+        BossCaptureContext c;
+        c.version = 8;
+        c.stage = GetMemContent<int>(0x164d2cc);
+        c.difficulty = GetMemContent<int>(0x160f538);
+        c.shot = GetMemContent<uint8_t>(0x164d0b1);
+        if (c.difficulty == 1 && (GetMemContent<uint32_t>(0x164d0b4) & 0x4000) && GetMemContent<uint16_t>(0x164d0b8) >= 205 && GetMemContent<uint16_t>(0x164d0b8) <= 221) c.difficulty = 7;
+        c.practiceSection = thPracParam.mode == 1 ? thPracParam.section : 0;
+        c.replay = THGuiRep::singleton().mRepStatus;
+        c.gameplay = GetMemContent<int>(GAMEMODE_ADDR) == 2;
+        c.fileTable = 0x4eccb8;
+        // ECL dispatcher 0x4184b0 reads the current instruction from
+        // [enemy+0x7f8]; the flat-field layout is what the 6/7/8 engines use.
+        c.instructionOffset = 0x7f8;
+        for (unsigned i=0;i<8;++i) c.bosses[i] = BossCaptureReadPointer(0xf54cc0+i*4);
+        if (c.bosses[0]) c.survival = (BossCaptureReadPointer(c.bosses[0]+0x3324) & (1u<<27)) != 0;
+        c.spellCapturable = (GetMemContent<uint32_t>(0x4ea670) & 4) != 0;
+        return c;
+    }
+    static const char* CaptureNativeLabel(int section, int difficulty)
+    {
+        if (section <= 0 || section >= static_cast<int>(_countof(th_sections_str[0][0]))) return "Boss";
+        return th_sections_str[Gui::LocaleGet()][std::clamp(difficulty,0,3)][section];
+    }
+
+    HOOKSET_DEFINE(THMainHook)
+    EHOOK_DY(th08_inf_lives, 0x0044D0FB,5, {
+        FastRetry(thPracParam.mode, false); // collision was reported before the deathbomb window
+
+        if ((*(THOverlay::singleton().mInfLives))) {
+            if (!g_adv_igi_options.map_inf_life_to_no_continue) {
+                *(DWORD*)(pCtx->Esp) = 0;
+            } else {
+                if (*(float*)(*(DWORD*)(0x160f510) + 0x74) < 1.0f)
+                    *(DWORD*)(pCtx->Esp) = 0;
+            }
+        }
+    })
+    EHOOK_DY(th08_everlasting_bgm, 0x45e1e0, 1, {
+        int32_t retn_addr = ((int32_t*)pCtx->Esp)[0];
+        int32_t bgm_cmd = ((int32_t*)pCtx->Esp)[1];
+        int32_t bgm_id = ((int32_t*)pCtx->Esp)[2];
+        int32_t call_addr = ((int32_t*)pCtx->Esp)[7];
+        int32_t th08_pause_test = ((int32_t*)pCtx->Esp)[6];
+
+        bool el_switch;
+        bool is_practice;
+        bool result;
+
+        el_switch = *(THOverlay::singleton().mElBgm) && !THGuiRep::singleton().mRepStatus && thPracParam.mode;
+        switch (thPracParam.section) {
+        case TH08_ST6A_LS:
+        case TH08_ST6B_LS1:
+        case TH08_ST6B_LS2:
+        case TH08_ST6B_LS3:
+        case TH08_ST6B_LS4:
+        case TH08_ST6B_LS5:
+            el_switch = false;
+        }
+        is_practice = GetMemContent(GAMEMODE_NEXT_ADDR) == 2;
+        if (retn_addr == 0x4480ed && th08_pause_test == 0x434d08)
+            result = ElBgmTest<0x447ef4, 0x4480ed, 0x43a170, 0x406c68, 0x43a048>(
+                el_switch, is_practice, 0x447ef4, 2, 2, call_addr);
+        else
+            result = ElBgmTest<0x447ef4, 0x4480ed, 0x43a170, 0x406c68, 0x43a048>(
+                el_switch, is_practice, retn_addr, bgm_cmd, bgm_id, call_addr);
+
+        if (result) {
+            pCtx->Eip = 0x45e2be;
+        }
+    })
+    // TODO: elBGM restart(difficult,,,)
+     EHOOK_DY(th08_midi_pause, 0x45D7DC, 3, {
+         if (g_adv_igi_options.th06_pauseBGM && *(BYTE*)(0x17CE88F) == 2) {
+     
+             // mid BGM uses a different method, so everlasting_bgm hook cannot set BGM playing correctly
+             bool el_switch;
+             el_switch = *(THOverlay::singleton().mElBgm) && !THGuiRep::singleton().mRepStatus && thPracParam.mode;
+             switch (thPracParam.section) {
+             case TH08_ST6A_LS:
+             case TH08_ST6B_LS1:
+             case TH08_ST6B_LS2:
+             case TH08_ST6B_LS3:
+             case TH08_ST6B_LS4:
+             case TH08_ST6B_LS5:
+                 el_switch = false;
+             }
+     
+             if (el_switch) {
+                 return;
+             } else {
+                 int cmd = *(int*)(pCtx->Ebp - 0x3C);
+                 if (cmd == 5) // stop
+                 {
+                     asm_call<0x443ED0, Thiscall>(*(DWORD*)0x17CE8E4); // StopTimer
+                     HMIDIOUT hmid = *(HMIDIOUT*)(*(DWORD*)(0x17CE8E4) + 0x13C);
+                     for (int i = 0; i < 16; i++) {
+                         midiOutShortMsg(hmid, (0xB0 | i) | (0x7B << 8) | (0x0 << 16));
+                         midiOutShortMsg(hmid, (0xB0 | i) | (0x79 << 8) | (0x0 << 16));
+                     }
+                 } else if (cmd == 6) // play
+                 {
+                     asm_call<0x443E50, Thiscall>(*(DWORD*)0x17CE8E4, 1, 0, 0); // find from midiOutOpen
+                 }
+             }
+         }
+     })
+     EHOOK_DY(th08_game_init, 0x4674ed, 1, {
+        if (thPracParam.mode == 1 && thPracParam.stage == 9) {
+            *(DWORD*)(pCtx->Ebp - 0x40) = 8;
+        }else{
+            if (*(DWORD*)(pCtx->Ecx + 0x6C) == 2){
+                *(DWORD*)(pCtx->Ebp - 0x40) = 15;
+            }else{
+                *(DWORD*)(pCtx->Ebp - 0x40) =  8;
+            }
+        }
+        thPracParam.Reset();
+        th08_familiar.Disable();
+    })
+    EHOOK_DY(th08_prac_menu_1, 0x46AE0D, 7, {
+        THGuiPrac::singleton().State(1);
+    })
+    EHOOK_DY(th08_prac_menu_3, 0x46b0af, 5, {
+        THGuiPrac::singleton().State(3);
+        *((int32_t*)0x164d2cc) = thPracParam.stage; // Stage
+        if (thPracParam.stage == 8) {
+            int32_t* diff = (int32_t*)0x160f538;
+            *diff = 4;
+        }
+        if (thPracParam.stage == 9) {
+            int32_t* diff = (int32_t*)0x160f538;
+            *diff = 1;
+
+            int32_t* sp = (int32_t*)0x164D0B4;
+             *sp |= 0x4000;
+            int16_t sp_idx = static_cast<int16_t>(thPracParam.section - TH08_LW_1 + 205); // sp index
+            *(WORD*)(0x164D0B8) = sp_idx;
+            int stage = 3;
+            switch (sp_idx)
+            {
+            case 205: stage = 0;break;
+            case 206: stage = 1;break;
+            case 207: stage = 2;break;
+            case 208: stage = 5;break;
+            case 209: stage = 6;break;
+            case 210: stage = 7;break;
+            case 211: stage = 8;break;
+            case 212: stage = 5;break;
+            case 213: stage = 8;break;
+            case 214: stage = 3;break;
+            case 215: stage = 4;break;
+            default: stage = 3;break;
+            }
+            *(DWORD*)(0x164D2CC)=stage;
+        }else{
+            int32_t* sp = (int32_t*)0x164D0B4;
+            *sp &= ~0x4000;
+        }
+        pCtx->Eip = 0x46b0b4;
+    })
+    EHOOK_DY(th08_prac_lw1, 0x467774,3, {
+        pCtx->Eax = *(DWORD*)(pCtx->Ebp - 0x40);
+    })
+    EHOOK_DY(th08_prac_menu_4, 0x46b117, 5, {
+        THGuiPrac::singleton().State(4);
+    })
+    EHOOK_DY(th08_rep_menu_1, 0x46e453, 6, {
+        THGuiRep::singleton().State(1);
+    })
+    EHOOK_DY(th08_rep_menu_2, 0x46e8d8, 7, {
+        THGuiRep::singleton().State(2);
+    })
+    EHOOK_DY(th08_rep_menu_3, 0x46ec2e, 6, {
+        THGuiRep::singleton().State(3);
+    })
+    EHOOK_DY(th08_unpause_prevent_desync, 0x40421a, 5, {
+        if (THGuiRep::singleton().mRepStatus)
+            return;
+
+        uint32_t GUI_impl = *(uint32_t*)(GUI_ADDR + 0x8);
+        int32_t dialog_index_maybe = *(int32_t*)(GUI_impl + 0x21814 + 0x8);
+        if (dialog_index_maybe >= 0 || dialog_index_maybe == -2) // same check the game performs (cf. 0x4358bb)
+            *(WORD*)(INPUT_ADDR) &= ~0x1; // clear shoot bit from input
+    })
+    EHOOK_DY(th08_disable_title, 0x439568, 5, {
+        if (thPracParam.mode == 1 && thPracParam.section) {
+            pCtx->Esp += 0xC;
+            pCtx->Eip = 0x4395ca;
+        }
+    })
+    EHOOK_DY(th08_disable_muteki, 0x44d886, 3, {
+        if (thPracParam.mode == 1 && thPracParam.section) {
+            pCtx->Eax &= 0xFFFFFF00;
+            pCtx->Eip = 0x44d889;
+        }
+    })
+     EHOOK_DY(th08_patch_main, 0x43b935, 1, {
+        th08_familiar.Disable();
+        if (thPracParam.mode == 1) {
+            int32_t real_score = (int32_t)(thPracParam.score / 10);
+            int32_t* score1 = (int32_t*)GetMemAddr(0x160f510, 0x8);
+            int32_t* score2 = (int32_t*)GetMemAddr(0x160f510, 0x0);
+            *score1 = *score2 = real_score;
+
+            float* life = (float*)GetMemAddr(0x160f510, 0x74);
+            *life = (thPracParam.life);
+
+            float* bomb = (float*)GetMemAddr(0x160f510, 0x80);
+            *bomb = (thPracParam.bomb);
+
+            float* power = (float*)GetMemAddr(0x160f510, 0x98);
+            *power = thPracParam.power;
+
+            int16_t* gauge = (int16_t*)GetMemAddr(0x160f510, 0x22);
+            *gauge = thPracParam.gauge;
+
+            int32_t* graze1 = (int32_t*)GetMemAddr(0x160f510, 0x4);
+            int32_t* graze2 = (int32_t*)GetMemAddr(0x160f510, 0xc);
+            *graze1 = *graze2 = thPracParam.graze;
+
+            *(uint32_t*)0xf54cf8 = thPracParam.frame;
+
+            THSetPoint();
+
+            int32_t* pTime1 = (int32_t*)0x164cfb4;
+            int32_t* pTime2 = (int32_t*)GetMemAddr(0x160f510, 0x3c);
+            int32_t* pTime3 = (int32_t*)GetMemAddr(0x160f510, 0x44);
+            *pTime1 = *pTime2 = *pTime3 = thPracParam.time;
+
+            int32_t* value = (int32_t*)GetMemAddr(0x160f510, 0x24);
+            *value = thPracParam.value;
+
+            int8_t* night = (int8_t*)GetMemAddr(0x160f510, 0x28);
+            *night = (int8_t)thPracParam.night;
+
+            if (thPracParam.familiar) {
+                th08_familiar.Setup();
+                th08_familiar.Enable();
+            }
+
+            if (thPracParam.rank) {
+                *(int32_t*)(0x164d334) = (int32_t)thPracParam.rank;
+                if (thPracParam.rankLock) {
+                    *(int32_t*)(0x164d338) = (int32_t)thPracParam.rank;
+                    *(int32_t*)(0x164d33c) = (int32_t)thPracParam.rank;
+                }
+            }
+
+            // ECL Patch
+            THSectionPatch();
+        }
+        g_gamefence = 1;
+        thPracParam._playLock = true;
+    })
+    EHOOK_DY(th08_bgm, 0x43a03c, 2, {
+        if (THBGMTest()) {
+            if (thPracParam.mode == 1 && (thPracParam.section == TH08_ST6A_LS || (thPracParam.section >= TH08_ST6B_LS1 && thPracParam.section <= TH08_ST6B_LS5))) {
+                PushHelper32(pCtx, 2);
+            } else {
+                PushHelper32(pCtx, 1);
+            }
+            pCtx->Eip = 0x43a03e;
+        }
+    })
+     EHOOK_DY(th08_save_replay, 0x453acc, 3, {
+         char* rep_name = *(char**)(pCtx->Ebp - 0x694);
+         if (thPracParam.mode)
+             THSaveReplay(rep_name);
+     })
+     PATCH_DY(th08_disable_prac_menu1, 0x46f47c, "9090909090")
+     PATCH_DY(th08_disable_prac_menu2, 0x46f59d, "9090909090")
+
+    EHOOK_DY(th08_update, 0x43cb37, 1, {
+        GameGuiBegin(IMPL_WIN32_DX8, !THAdvOptWnd::singleton().IsOpen() && !GameAddedFeaturesIsOpen());
+
+        // Gui components update
+        THGuiPrac::singleton().Update();
+        THGuiRep::singleton().Update();
+        THOverlay::singleton().Update();
+        TH08InGameInfo::singleton().Update();
+
+        if (g_adv_igi_options.show_keyboard_monitor && (GetMemContent(GAMEMODE_ADDR) == 2)) {
+            g_adv_igi_options.keyboard_style.size = { 34.0f, 34.0f };
+            KeysHUD(8, { 1280.0f, 0.0f }, { 833.0f, 0.0f }, g_adv_igi_options.keyboard_style);
+        }
+        
+        auto p = ImGui::GetOverlayDrawList();
+        RenderBtHitbox(p);
+        RenderLockTimer(p);
+        GameUpdateOuter(p, 8);
+        GameStatusHudDraw(p, 8, *THOverlay::singleton().mInGameInfo);
+        
+        bool drawCursor = UpdateGameSettingsWindows<THAdvOptWnd>() || THGuiPrac::singleton().IsOpen();
+        if (GetMemContent<int>(GAMEMODE_ADDR) == 2) {
+            ReportPluginStage({
+                GetMemContent<int>(STAGE_INDEX_ADDR), GetMemContent<uint8_t>(SHOTTYPE_ADDR),
+                thPracParam.mode != 0, THGuiRep::singleton().mRepStatus
+            });
+        } else {
+            ReportPluginStage(nullptr);
+        }
+        GameGuiEnd(drawCursor);
+    })
+    EHOOK_DY(th08_player_state, 0x44C390,1,{
+        if (g_adv_igi_options.show_keyboard_monitor)
+            RecordKey(8, *(WORD*)(0x164D52C));
+    })
+    EHOOK_DY(th08_render, 0x43cc45, 1, {
+        if (GameGuiUsesDx8OverlayScene()) return;
+        // Keep the established draw-chain hook (also used by frame-rate patches),
+        // but submit native sprites before painting the THP window above them.
+        if (AddonEnabled(Addon::Repairs) && GameGuiProgress == 2) asm_call<0x462e40, Thiscall>(*(DWORD*)0x18bdc90);
+        GameGuiRender(IMPL_WIN32_DX8);
+    })
+    // Exactly one instruction before th08_gui_create_2
+    EHOOK_DY(th08_recreate_device, 0x442A7E, 1, {
+        GameGuiInit(IMPL_WIN32_DX8, 0x17ce760, 0x17ce700,
+            Gui::INGAGME_INPUT_GEN1, 0x164d528, 0x164d530, 0x164d538,
+            -1);
+        GameGuiSetNativeRedrawCounter(reinterpret_cast<volatile int32_t*>(0x17ce8cc), 2);
+        GameGuiEnableDx8OverlayScene();
+    })
+    HOOKSET_ENDDEF()
+
+    HOOKSET_DEFINE(THInGameInfo)
+    EHOOK_DY(th08_enter_game, 0x43BDD2, 5, {
+        ReportPluginStage(nullptr);
+        RouteTrace::Instance().NewRun(8);
+        BossCaptureNewRun(); // set inner misscount to 0
+    
+        TH08InGameInfo::singleton().mLSCCount = 0;
+        TH08InGameInfo::singleton().mSCCount = 0;
+        TH08InGameInfo::singleton().mBombCount = 0;
+        TH08InGameInfo::singleton().mMissCount = 0;
+        TH08InGameInfo::singleton().mDesolveCount = 0;
+    })
+    EHOOK_DY(th08_spell_capture, 0x416265, 3, { // to enable SC count in rep, do not directly read spell capture array
+        BossCaptureSpellCaptured(BossCaptureReadPointer(pCtx->Eax + 4));
+        const static int32_t last_spells[] = {
+            10, 11, 12,
+            29, 30, 31,
+            51, 52, 53,
+            74, 75, 76,
+            97, 98, 99,
+            116, 117, 118,
+            143, 144, 145, 146,
+            171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190,
+            204
+        };
+        TH08InGameInfo::singleton().mSCCount++;
+        int32_t cur_spell = *(int32_t*)0x004EA678;
+        for (int j = 0; j < 43; j++) {
+            if (cur_spell == last_spells[j])
+                TH08InGameInfo::singleton().mLSCCount++;
+        }
+    })
+    EHOOK_DY(th08_player_bomb, 0x44CA94, 6, {
+        BossCaptureFailed();
+    })
+    EHOOK_DY(th08_player_bomb, 0x44CA6A, 3, {
+        BossCaptureFailed();//deadbomb
+    })
+    EHOOK_ADDON_DY(th08_player_hit, 0x44AB40, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
+        BossCapturePlayerHit(); // actual collision, before the delayed life-loss callback
+    })
+    EHOOK_DY(th08_desolve, 0x44ABE9,3,{
+        TH08InGameInfo::singleton().mDesolveCount++;
+        FastRetry(thPracParam.mode, false);
+    })
+    EHOOK_DY(th08_lock_timer1, 0x437AF3,3,{ // initialize
+    
+        g_lock_timer = 0;
+    })
+    EHOOK_DY(th08_lock_timer2, 0x41CB32,2,{ // set timeout case 132
+        g_lock_timer = 0;
+    })
+    EHOOK_DY(th08_lock_timer3, 0x41C44F, 2, {
+        BossCaptureConfigured(BossCaptureReadPointer(pCtx->Ebp+8), BossCaptureReadPointer(pCtx->Ebp-0xc)); // set boss mode case 127
+        g_lock_timer = 0;
+    })
+    EHOOK_DY(th08_lock_timer4, 0x42F34D, 3, { // decrease time (update)
+        g_lock_timer++;
+    })
+
+    // Capture settlements: the native HP/timeout condition has already succeeded.
+    EHOOK_ADDON_DY(th08_capture_hp, 0x42b557, 5, (1u << static_cast<unsigned>(Addon::Capture)), {
+        BossCaptureCleared(BossCaptureReadPointer(pCtx->Ebp-0x1c), false);
+    })
+    EHOOK_ADDON_DY(th08_capture_time, 0x42ba69, 5, (1u << static_cast<unsigned>(Addon::Capture)), {
+        BossCaptureCleared(BossCaptureReadPointer(pCtx->Ebp-0x18), true);
+    })
+    // The timer setter is shared. Admit only the ECL interpreter callers and
+    // recover the exact instruction before configuring a canonical attack.
+    EHOOK_ADDON_DY(th08_capture_config, 0x4065f0, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
+        const auto caller = BossCaptureReadPointer(pCtx->Esp);
+        if (caller >= 0x410000 && caller < 0x41e800)
+            BossCaptureConfigured(pCtx->Ecx-0x2e14, BossCaptureReadPointer(pCtx->Ebp-0xc));
+    })
+    HOOKSET_ENDDEF()
+
+    HOOKSET_DEFINE(TH08Checksum)
+    EHOOK_DY(th08_checksum1, 0x448679, 3, { // checksum read fix
+        *(DWORD*)(pCtx->Ebp + 0xC) = *(DWORD*)(pCtx->Ebp - 0x14);
+        *(DWORD*)(pCtx->Ebp + 0x10) = *(DWORD*)(pCtx->Ebp - 0x8);
+    })
+    EHOOK_DY(th08_checksum2, 0x443836,2,{ // checksum
+        *(DWORD*)(0x17CEAB0) = 840704;
+        *(DWORD*)(0x17CEAAC) = 2724749753;
+        // 1.00d
+    })
+    HOOKSET_ENDDEF()
+
+    // Route reference (F10). Imperishable Night's stage counter is already
+    // 0-based; the player position is the centre of the hitbox rectangle.
+    static void THRouteTraceInit()
+    {
+        auto& profile = RouteProfileFor(8);
+        profile.configured = true;
+        profile.game = 8;
+        profile.appdata = L"ShanghaiAlice\\th08";
+        profile.stageCount = 9;
+        profile.readPlayer = [](float& x, float& y) {
+            // Native float movement source; hitboxes are derived from it.
+            x = GetMemContent<float>(0x17D5EF8 + 0x2B4) - 192.0f;
+            y = GetMemContent<float>(0x17D5EF8 + 0x2B4 + 4);
+            return std::isfinite(x) && std::isfinite(y)
+                && x >= -260 && x <= 260 && y >= -80 && y <= 640;
+        };
+        profile.writePlayer = [](float x, float y) {
+            return WriteStaticPlayer(0x17D5EF8, 0x2B4, {0x38C, 0x398, 0x3A4, 0x3B0, 0x3BC, 0x3C8}, 192.0f, x, y);
+        };
+        profile.readStage = [] { return GetMemContent<int>(0x164d2cc); };
+        profile.readDifficulty = [] {
+            int difficulty = GetMemContent<int>(0x160f538);
+            // Extra is stored as the normal difficulty plus a flag; keep its
+            // own id so routes do not mix with the normal stage runs.
+            if (difficulty == 1 && (GetMemContent<uint32_t>(0x164d0b4) & 0x4000)
+                && GetMemContent<uint16_t>(0x164d0b8) >= 205 && GetMemContent<uint16_t>(0x164d0b8) <= 221)
+                difficulty = 7;
+            return difficulty;
+        };
+        profile.readShot = [] { return static_cast<int>(GetMemContent<uint8_t>(0x164d0b1)); };
+        profile.replayActive = [] { return THGuiRep::singleton().mRepStatus; };
+        profile.practiceSection = [] { return thPracParam.mode == 1 ? thPracParam.section : 0; };
+        profile.practicePhase = [] { return thPracParam.phase; };
+        profile.replayName = [] { return THGuiRep::singleton().RouteReplayName(); };
+    }
+
+    static __declspec(noinline) void THGuiCreate()
+    {
+        if (ImGui::GetCurrentContext()) {
+            return;
+        }
+        // Init
+        THRouteTraceInit();
+        GameGuiInit(IMPL_WIN32_DX8, 0x17ce760, 0x17ce700,
+            Gui::INGAGME_INPUT_GEN1, 0x164d528, 0x164d530, 0x164d538,
+            -1);
+        GameGuiSetNativeRedrawCounter(reinterpret_cast<volatile int32_t*>(0x17ce8cc), 2);
+        GameGuiEnableDx8OverlayScene();
+
+        SetDpadHook(0x43D48B, 3);
+        // Gui components creation
+        THGuiPrac::singleton();
+        THGuiRep::singleton();
+        THOverlay::singleton();
+        TH08InGameInfo::singleton();
+
+        // Hooks
+        BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
+        EnableAllHooks(THMainHook);
+        EnableAllHooks(THInGameInfo);
+        EnableAllHooks(TH08Checksum);
+        th08_name_fix.Setup();
+        // Reset thPracParam
+        thPracParam.Reset();
+
+        RsqrtssCompatiable::Init();
+        EnableAllHooks(RSQRT_HOOKS);
+        DisableAllHooks(RSQRT_HOOKS);// default turn off
+    }
+
+    HOOKSET_DEFINE(THInitHook)
+    PATCH_DY(th08_disable_dataver, 0x40bb80, "33c0c3")
+    PATCH_DY(th08_disable_demo, 0x467aca, "ffffff7f")
+    EHOOK_DY(th08_disable_mutex, 0x44344A, 5, {
+        pCtx->Eip = 0x44346b;
+    })
+    EHOOK_DY(th08_gui_init_1, 0x467960, 2, {
+        THGuiCreate();
+        self->Disable();
+    })
+    EHOOK_DY(th08_gui_init_2, 0x442a7f, 1, {
+        THGuiCreate();
+        self->Disable();
+    })
+    HOOKSET_ENDDEF()
+}
+
+void TH08Init()
+{
+    EnableAllHooks(TH08::THInitHook);
+    InitHook(8,(void*)0x442591);
+
+    //VFSHook(VFS_TH08, (void*)0x43e660);
+    //VFSAddListener("stg4abg.anm", nullptr, TH08::THStage4ANM);
+}
+
+/*
+    Memo:
+    0xF54CF0: Timeline Struct
+    0x4ECCB8: ECL Buffer Pointer
+    0x4E4824: STD Buffer
+    0x4E483C & 0x4E4844: STD Time
+    */
+}

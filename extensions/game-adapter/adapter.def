@@ -1,0 +1,3 @@
+EXPORTS
+    THPracExtensionQuery
+    THPracAdapterFeatureMask=_THPracAdapterFeatureMask@4

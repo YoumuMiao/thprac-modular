@@ -1,0 +1,2335 @@
+#include "host_apply.h"
+#include "feature_runtime.h"
+#include "thprac_launcher_cfg.h"
+#include "thprac_gui_locale.h"
+#include "thprac_launcher_main.h"
+#include "thprac_launcher_games.h"
+#include "thprac_launcher_utils.h"
+#include "thprac_launcher_wnd.h"
+#include "thprac_licence.h"
+#include "thprac_version.h"
+#include "thprac_utils.h"
+#include "utils/utils.h"
+#include "..\..\resource.h"
+#include <Windows.h>
+#include <functional>
+#include <string>
+#include <vector>
+#include <array>
+#include <format>
+#include <cstdarg>
+#include <ShlObj.h>
+#include "thprac_igi_key_render.h"
+#include "thprac_gui_components.h"
+#include <stdexcept>
+#pragma warning(push)
+#pragma warning(disable : 26819)
+#include <rapidjson/prettywriter.h>
+#pragma warning(pop)
+#include <shlwapi.h>
+#include <dinput.h>
+#include <set>
+#include <filesystem>
+
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+namespace THPrac {
+extern HHOOK g_hKeyboardHook;
+
+std::wstring* gCfgPath = nullptr;
+int gCfgIsLocalDir = 0;
+bool gCfgLocalBackupAvaliable = false;
+bool gCfgReadOnly = false;
+HANDLE gCfgHnd = INVALID_HANDLE_VALUE;
+rapidjson::Document gCfgJson;
+
+static std::wstring ExtensionInstallDirectory()
+{
+    const auto* install = LauncherInstallDirectory();
+    if (!install) install = AdapterInstallDirectory();
+    if (install && *install) return std::wstring(install) + L"\\";
+
+    wchar_t path[32768];
+    const auto length = GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, static_cast<DWORD>(std::size(path)));
+    if (!length || length >= std::size(path)) return {};
+    return std::filesystem::path(path).parent_path().parent_path().parent_path().wstring() + L"\\";
+}
+
+void LauncherAquireDataDirVar()
+{
+    if (gCfgPath) {
+        return;
+    }
+    gCfgPath = new std::wstring();
+
+    std::wstring path = ExtensionInstallDirectory();
+
+    auto backupPath = path + L".thprac_data_backup";
+    auto backupPathAttr = GetFileAttributesW(backupPath.c_str());
+    if (backupPathAttr != INVALID_FILE_ATTRIBUTES && backupPathAttr & FILE_ATTRIBUTE_DIRECTORY) {
+        gCfgLocalBackupAvaliable = true;
+    }
+
+    path += L".thprac_data";
+    auto fileAttr = GetFileAttributesW(path.c_str());
+    if (fileAttr != INVALID_FILE_ATTRIBUTES && fileAttr & FILE_ATTRIBUTE_DIRECTORY) {
+        gCfgIsLocalDir = 1;
+        path += L"\\";
+    } else {
+        gCfgIsLocalDir = 0;
+        wchar_t appDataPath[MAX_PATH];
+        if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath) == S_OK) {
+            path = appDataPath;
+            path += L"\\thprac\\";
+        } else {
+            path = L"";
+        }
+    }
+
+    *gCfgPath = path;
+}
+std::wstring LauncherGetDataDir()
+{
+    LauncherAquireDataDirVar();
+
+    return *gCfgPath;
+}
+
+bool LauncherCfgWrite()
+{
+    if (gCfgHnd == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    rapidjson::StringBuffer sb;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(sb);
+    gCfgJson.Accept(writer);
+
+    auto jsonStr = sb.GetString();
+    auto jsonStrLen = strlen(jsonStr);
+    DWORD bytesProcessed;
+    SetFilePointer(gCfgHnd, 0, nullptr, FILE_BEGIN);
+    SetEndOfFile(gCfgHnd);
+    return WriteFile(gCfgHnd, jsonStr, jsonStrLen, &bytesProcessed, nullptr);
+}
+rapidjson::Document& LauncherCfgGet()
+{
+    return gCfgJson;
+}
+
+void CreateNewSettingFile(const std::wstring& newVerFile, const std::wstring& oldVerFile)
+{
+    DWORD attr = GetFileAttributesW(newVerFile.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return ;
+    }
+    attr = GetFileAttributesW(oldVerFile.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return ;
+    }
+    CopyFileW(oldVerFile.c_str(), newVerFile.c_str(), TRUE);
+    return;
+}
+
+bool LauncherCfgInit(bool noCreate)
+{
+    if (gCfgHnd != INVALID_HANDLE_VALUE) {
+        return true;
+    }
+
+    std::wstring dataDir = LauncherGetDataDir();
+    CreateDirectoryW(dataDir.c_str(), nullptr);
+    std::wstring jsonPath = dataDir + L"thpracP.json";
+
+    CreateNewSettingFile(jsonPath, dataDir + L"thprac.json");// copy from old version THP
+    DWORD openFlag = noCreate ? OPEN_EXISTING : OPEN_ALWAYS;
+    DWORD openAccess = noCreate ? GENERIC_READ : GENERIC_READ | GENERIC_WRITE;
+    gCfgHnd = CreateFileW(jsonPath.c_str(), openAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, openFlag, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (gCfgHnd == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD bytesProcessed;
+    auto fileSize = GetFileSize(gCfgHnd, nullptr);
+    auto fileBuffer = malloc(fileSize + 1);
+    memset(fileBuffer, 0, fileSize + 1);
+    if (!ReadFile(gCfgHnd, fileBuffer, fileSize, &bytesProcessed, nullptr)) {
+        return false;
+    }
+
+    if (gCfgJson.Parse((const char*)fileBuffer, fileSize + 1).HasParseError()) {
+        gCfgJson.SetObject();
+        return LauncherCfgWrite();
+    }
+
+    gCfgReadOnly = noCreate;
+    return true;
+}
+void LauncherCfgClose()
+{
+    if (gCfgHnd != INVALID_HANDLE_VALUE) {
+        if (!gCfgReadOnly) {
+            LauncherCfgWrite();
+        }
+        CloseHandle(gCfgHnd);
+        gCfgReadOnly = false;
+        gCfgHnd = INVALID_HANDLE_VALUE;
+        delete gCfgPath;
+        gCfgPath = nullptr;
+    }
+}
+
+rapidjson::Value& GetCfgSettingsJson()
+{
+    if (gCfgJson.HasMember("settings")) {
+        if (!gCfgJson["settings"].IsObject()) {
+            gCfgJson["settings"].SetObject();
+        }
+    } else {
+        rapidjson::Document settingsJson;
+        settingsJson.SetObject();
+        JsonAddMemberA(gCfgJson, "settings", settingsJson, gCfgJson.GetAllocator());
+    }
+    return gCfgJson["settings"];
+}
+bool LauncherSettingGet(const char* name, int& valueOut)
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember(name) && settingsJson[name].IsInt()) {
+            valueOut = settingsJson[name].GetInt();
+            return true;
+        }
+    }
+    return false;
+}
+bool LauncherSettingRemove(const char* name)
+{
+    if (gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember(name)) {
+            settingsJson.EraseMember(name);
+            return true;
+        }
+    }
+    return false;
+}
+bool LauncherSettingGet(const char* name, unsigned int& valueOut)
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember(name) && settingsJson[name].IsUint()) {
+            valueOut = settingsJson[name].GetUint();
+            return true;
+        }
+    }
+    return false;
+}
+bool LauncherSettingGet(const char* name, bool& valueOut)
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember(name) && settingsJson[name].IsBool()) {
+            valueOut = settingsJson[name].GetBool();
+            return true;
+        }
+    }
+    return false;
+}
+bool LauncherSettingGet(const char* name, float& valueOut)
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember(name) && settingsJson[name].IsFloat()) {
+            valueOut = settingsJson[name].GetFloat();
+            return true;
+        }
+    }
+    return false;
+}
+bool LauncherSettingGet(const char* name, const char*& valueOut)
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember(name) && settingsJson[name].IsString()) {
+            valueOut = settingsJson[name].GetString();
+            return true;
+        }
+    }
+    return false;
+}
+bool LauncherSettingGet(const char* name, std::string& valueOut)
+{
+    const char* _valueOut;
+    if (LauncherSettingGet(name, _valueOut)) {
+        valueOut = _valueOut;
+        return true;
+    } else {
+        return false;
+    }
+}
+void LauncherSettingSet(const char* name, int valueIn)
+{
+    auto& settingsJson = GetCfgSettingsJson();
+    if (settingsJson.HasMember(name)) {
+        settingsJson.RemoveMember(name);
+    }
+    JsonAddMember(settingsJson, name, valueIn, gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+void LauncherSettingSet(const char* name, unsigned int valueIn)
+{
+    auto& settingsJson = GetCfgSettingsJson();
+    if (settingsJson.HasMember(name)) {
+        settingsJson.RemoveMember(name);
+    }
+    JsonAddMember(settingsJson, name, valueIn, gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+void LauncherSettingSet(const char* name, bool valueIn)
+{
+    auto& settingsJson = GetCfgSettingsJson();
+    if (settingsJson.HasMember(name)) {
+        settingsJson.RemoveMember(name);
+    }
+    JsonAddMember(settingsJson, name, valueIn, gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+void LauncherSettingSet(const char* name, float valueIn)
+{
+    auto& settingsJson = GetCfgSettingsJson();
+    if (settingsJson.HasMember(name)) {
+        settingsJson.RemoveMember(name);
+    }
+    JsonAddMember(settingsJson, name, valueIn, gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+bool LauncherSettingGet(const char* name, std::array<int, 2>& valueOut)
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        char name2[256] = { 0 };
+        sprintf_s(name2, "%s_1", name);
+        if (settingsJson.HasMember(name2) && settingsJson[name2].IsInt()) {
+            valueOut[0] = settingsJson[name2].GetInt();
+        } else {
+            return false;
+        }
+        sprintf_s(name2, "%s_2", name);
+        if (settingsJson.HasMember(name2) && settingsJson[name2].IsInt()) {
+            valueOut[1] = settingsJson[name2].GetInt();
+        } else {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+void LauncherSettingSet(const char* name, std::array<int,2> valueIn)
+{
+    auto& settingsJson = GetCfgSettingsJson();
+    char name2[256] = { 0 };
+    sprintf_s(name2, "%s_1", name);
+    if (settingsJson.HasMember(name2)) {
+        settingsJson.RemoveMember(name2);
+    }
+    JsonAddMember(settingsJson, name2, valueIn[0], gCfgJson.GetAllocator());
+
+
+    sprintf_s(name2, "%s_2", name);
+    if (settingsJson.HasMember(name2)) {
+        settingsJson.RemoveMember(name2);
+    }
+    JsonAddMember(settingsJson, name2, valueIn[1], gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+
+void LauncherSettingSet(const char* name, const char* valueIn) {
+    auto& settingsJson = GetCfgSettingsJson();
+    if (settingsJson.HasMember(name)) {
+        settingsJson.RemoveMember(name);
+    }
+    JsonAddMemberA(settingsJson, name, valueIn, gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+void LauncherSettingSet(const char* name, const std::string valueIn)
+{
+    LauncherSettingSet(name, valueIn.c_str());
+}
+
+std::unordered_map<KeyDefine, KeyDefine, KeyDefineHashFunction> g_keybind;
+void LauncherSettingGet_KeyBind()
+{
+    if (gCfgJson.IsObject() && gCfgJson.HasMember("settings") && gCfgJson["settings"].IsObject()) {
+        auto& settingsJson = gCfgJson["settings"];
+        if (settingsJson.HasMember("keybind") && settingsJson["keybind"].IsArray())
+        {
+            auto keybind_arr = settingsJson["keybind"].GetArray();
+            for (auto& keybind : keybind_arr){
+                if (keybind.HasMember("from") && keybind["from"].IsString() && keybind.HasMember("to") && keybind["to"].IsString()) {
+                    std::string keyname1 = keybind["from"].GetString();
+                    std::string keyname2 = keybind["to"].GetString();
+                    KeyDefine k1 = { 0 }, k2 = { 0 };
+                    int ok = 0;
+                    for (auto& keydef : keyBindDefine)
+                    {
+                        if (keydef.keyname == keyname1) {k1 = keydef; ok++; }
+                        if (keydef.keyname == keyname2) {k2 = keydef; ok++; }
+                    }
+                    if (ok == 2)
+                        g_keybind[k1] = k2;
+                }
+            }
+        }
+    }
+    return;
+}
+
+void LauncherSettingSet_KeyBind()
+{
+    auto& settingsJson = GetCfgSettingsJson();
+    if (settingsJson.HasMember("keybind")) {
+        settingsJson.RemoveMember("keybind");
+    }
+    rapidjson::Value arr(rapidjson::kArrayType);
+    for (auto& keybind : g_keybind)
+    {
+        rapidjson::Value bind(rapidjson::kObjectType);
+        auto key1=keybind.first.keyname;
+        auto key2 = keybind.second.keyname;
+        JsonAddMemberA(bind, "from", key1.c_str(), gCfgJson.GetAllocator());
+        JsonAddMemberA(bind, "to", key2.c_str(), gCfgJson.GetAllocator());
+        arr.PushBack(bind, gCfgJson.GetAllocator());
+    }
+    JsonAddMemberA(settingsJson, "keybind", arr, gCfgJson.GetAllocator());
+    LauncherCfgWrite();
+}
+
+
+bool SetTheme(int themeId, const wchar_t* userThemeName)
+{
+    switch (themeId) {
+    case 0:
+        Gui::StyleColorsDarkGreen();
+        return false;
+    case 1:
+        Gui::StyleColorsLightJade();
+        return false;
+    case 2:
+        ImGui::StyleColorsClassic();
+        Gui::ApplyIconGreenAccent();
+        return false;
+    default:
+        // Do nothing
+        break;
+    }
+
+    if (userThemeName == nullptr)
+        return true; // TODO: Should we return false instead?
+
+    std::wstring filename = LauncherGetDataDir() + L"themes\\" + userThemeName;
+    rapidjson::Document theme;
+    auto getColor = [&filename, &theme](const char *const colorName) -> ImVec4 {
+        using std::runtime_error, std::format;
+
+        if (!theme.HasMember(colorName))
+            throw runtime_error(format("Missing element: {}", colorName));
+        if (!theme[colorName].IsArray())
+            throw runtime_error(format("Wrong format for {}", colorName));
+
+        const auto& jsonVec = theme[colorName].GetArray();
+        if (jsonVec.Size() < 4)
+            throw runtime_error(format("Not enough color channels in %s", colorName));
+
+        float channels[4];
+        for (int i = 0; i < 4; i++) {
+            if (jsonVec[i].IsNumber()) {
+                channels[i] = jsonVec[i].GetFloat();
+            } else if (jsonVec[i].IsString()) {
+                channels[i] = std::stof(jsonVec[i].GetString());
+            } else {
+                throw runtime_error(format("%s: wrong format", colorName));
+            }
+        }
+
+        return ImVec4(channels[0], channels[1], channels[2], channels[3]);
+    };
+
+    try {
+        MappedFile file(filename.c_str());
+        if (!file.fileMapView)
+            throw std::runtime_error("File not found");
+        if (theme.Parse((char*)file.fileMapView, file.fileSize).HasParseError())
+            throw std::runtime_error("Invalid JSON (TODO: describe how)");
+
+        ImVec4 colors[ImGuiCol_COUNT];
+        #define GET_COLOR(color) \
+            colors[ImGuiCol_ ## color] = getColor(#color);
+
+        GET_COLOR(Text);
+        GET_COLOR(TextDisabled);
+        GET_COLOR(WindowBg);
+        GET_COLOR(ChildBg);
+        GET_COLOR(PopupBg);
+        GET_COLOR(Border);
+        GET_COLOR(BorderShadow);
+        GET_COLOR(FrameBg);
+        GET_COLOR(FrameBgHovered);
+        GET_COLOR(FrameBgActive);
+        GET_COLOR(TitleBg);
+        GET_COLOR(TitleBgActive);
+        GET_COLOR(TitleBgCollapsed);
+        GET_COLOR(MenuBarBg);
+        GET_COLOR(ScrollbarBg);
+        GET_COLOR(ScrollbarGrab);
+        GET_COLOR(ScrollbarGrabHovered);
+        GET_COLOR(ScrollbarGrabActive);
+        GET_COLOR(CheckMark);
+        GET_COLOR(SliderGrab);
+        GET_COLOR(SliderGrabActive);
+        GET_COLOR(Button);
+        GET_COLOR(ButtonHovered);
+        GET_COLOR(ButtonActive);
+        GET_COLOR(Header);
+        GET_COLOR(HeaderHovered);
+        GET_COLOR(HeaderActive);
+        GET_COLOR(Separator);
+        GET_COLOR(SeparatorHovered);
+        GET_COLOR(SeparatorActive);
+        GET_COLOR(ResizeGrip);
+        GET_COLOR(ResizeGripHovered);
+        GET_COLOR(ResizeGripActive);
+        GET_COLOR(Tab);
+        GET_COLOR(TabHovered);
+        GET_COLOR(TabActive);
+        GET_COLOR(TabUnfocused);
+        GET_COLOR(TabUnfocusedActive);
+        GET_COLOR(PlotLines);
+        GET_COLOR(PlotLinesHovered);
+        GET_COLOR(PlotHistogram);
+        GET_COLOR(PlotHistogramHovered);
+        GET_COLOR(TableHeaderBg);
+        GET_COLOR(TableBorderStrong);
+        GET_COLOR(TableBorderLight);
+        GET_COLOR(TableRowBg);
+        GET_COLOR(TableRowBgAlt);
+        GET_COLOR(TextSelectedBg);
+        GET_COLOR(DragDropTarget);
+        GET_COLOR(NavHighlight);
+        GET_COLOR(NavWindowingHighlight);
+        GET_COLOR(NavWindowingDimBg);
+        GET_COLOR(ModalWindowDimBg);
+
+        #undef GET_COLOR
+        ImGuiStyle& style = ImGui::GetStyle();
+        memcpy(style.Colors, colors, sizeof(colors));
+        // User themes follow the icon accent as well, so no blue accent survives.
+        Gui::ApplyIconGreenAccent();
+    } catch (std::runtime_error err) {
+        std::wstring err_desc = L"Failed to load theme ";
+        err_desc.append(filename).append(L"\r\n").append(utf8_to_utf16(err.what()));
+        MessageBoxW(nullptr, err_desc.c_str(), L"Failed to load theme", MB_ICONERROR);
+        Gui::StyleColorsLightJade();
+        // TODO: Should we return false at this point?
+    }
+
+    return true;
+}
+
+template <typename T>
+class THSetting {
+public:
+    THSetting() = delete;
+    THSetting(const char* _name, T _value)
+    {
+        name = _name;
+        value = _value;
+        Init();
+    }
+    virtual void Init() final
+    {
+        if (!LauncherSettingGet(name.c_str(), value)) {
+            LauncherSettingSet(name.c_str(), value);
+        }
+    }
+    virtual T& Get()
+    {
+        return value;
+    }
+    virtual void Set(T& _value)
+    {
+        value = _value;
+        LauncherSettingSet(name.c_str(), value);
+    }
+    virtual void Set()
+    {
+        LauncherSettingSet(name.c_str(), value);
+    }
+
+protected:
+    std::string name;
+    T value;
+};
+
+template <>
+class THSetting<std::string> {
+public:
+    THSetting() = delete;
+    THSetting(const char* _name, const char* _value)
+    {
+        name = _name;
+        value = _value;
+        Init();
+    }
+    THSetting(const char* _name, std::string _value)
+    {
+        name = _name;
+        value = _value;
+        Init();
+    }
+    virtual void Init() final
+    {
+        if (!LauncherSettingGet(name.c_str(), value)) {
+            LauncherSettingSet(name.c_str(), value);
+        }
+    }
+    virtual std::string& Get()
+    {
+        return value;
+    }
+    virtual void Set(const std::string& _value)
+    {
+        value = _value;
+        LauncherSettingSet(name.c_str(), value);
+    }
+    virtual void Set()
+    {
+        LauncherSettingSet(name.c_str(), value);
+    }
+
+protected:
+    std::string name;
+    std::string value;
+};
+
+
+class THCfgInt : public THSetting<int> {
+private:
+    int minv, maxv;
+public:
+    THCfgInt(const char* _name, int _value, int minval,int maxval)
+        : THSetting(_name, _value)
+        , minv(minval)
+        , maxv(maxval)
+    {
+    }
+    void Gui(const char* guiTxt, const char* helpTxt = nullptr)
+    {
+        if (ImGui::InputInt(guiTxt, &value)) {
+            value = std::clamp(value, minv, maxv);
+            LauncherSettingSet(name.c_str(), value);
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+    }
+};
+
+
+class THCfgInt2 : public THSetting<std::array<int,2>> {
+private:
+    int minv, maxv;
+
+public:
+    THCfgInt2(const char* _name, std::array<int, 2> _value, int minval, int maxval)
+        : THSetting(_name, _value)
+        , minv(minval)
+        , maxv(maxval)
+    {
+    }
+    void Gui(const char* guiTxt, const char* helpTxt = nullptr)
+    {
+        if (ImGui::DragInt2(guiTxt, value.data(), 1.0, minv, maxv)) {
+            LauncherSettingSet(name.c_str(), value);
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+    }
+};
+
+class THCfgFloat : public THSetting<float> {
+public:
+    float mMin, mMax;
+    THCfgFloat(const char* _name, float _value,float _min,float _max)
+        : THSetting(_name, _value) , mMin(_min), mMax(_max)
+    {
+    }
+    void Gui(const char* guiTxt, const char* helpTxt = nullptr)
+    {
+        if (ImGui::DragFloat(guiTxt, &value, 1.0, mMin, mMax)) {
+            value = std::clamp(value, mMin, mMax);
+            LauncherSettingSet(name.c_str(), value);
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+    }
+};
+
+class THCfgColor : public THSetting<uint32_t> {
+public:
+    THCfgColor(const char* _name, uint32_t _value)
+        : THSetting(_name, _value)
+    {
+    }
+    void Gui(const char* guiTxt, const char* helpTxt = nullptr)
+    {
+        ImVec4 color = ImGui::ColorConvertU32ToFloat4(value);
+        if (ImGui::ColorEdit4(guiTxt, (float*)&color),ImGuiColorEditFlags_NoInputs) {
+            uint32_t value2 = ImGui::ColorConvertFloat4ToU32(color);
+            if (value != value2){
+                value = value2;
+                LauncherSettingSet(name.c_str(), value2);
+            }
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+    }
+};
+
+class THCfgCheckboxEx : public THSetting<bool> {
+public:
+    THCfgCheckboxEx(const char* _name, bool _value)
+        : THSetting(_name, _value)
+    {
+    }
+    bool Gui(const char* guiTxt, const char* helpTxt = nullptr)
+    {
+        bool result = false;
+        if (ImGui::Checkbox(guiTxt, &value)) {
+            value = !value;
+            result = true;
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+        return result;
+    }
+    void Toggle()
+    {
+        value = !value;
+        LauncherSettingSet(name.c_str(), value);
+    }
+};
+
+class THCfgCheckbox : public THSetting<bool> {
+public:
+    THCfgCheckbox(const char* _name, bool _value)
+        : THSetting(_name, _value)
+    {
+    }
+    void Gui(const char* guiTxt, const char* helpTxt = nullptr)
+    {
+        if (ImGui::Checkbox(guiTxt, &value)) {
+            LauncherSettingSet(name.c_str(), value);
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+    }
+};
+
+class THCfgText : public THSetting<std::string> {
+private:
+    int32_t len;
+public:
+    THCfgText(const char* _name, std::string _value, int32_t _len)
+        : THSetting(_name, _value)
+        , len(_len)
+    {
+    }
+    void Gui(const char* guiTxt, const char* helpTxt = nullptr, ImGuiInputTextFlags_ flags = ImGuiInputTextFlags_None, ImGuiInputTextCallback callback = nullptr)
+    {
+        value.resize(len);
+        if (ImGui::InputText(guiTxt, value.data(), len, flags, callback)) {
+            LauncherSettingSet(name.c_str(), value);
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+    }
+};
+
+class THCfgCombo : public THSetting<int> {
+public:
+    THCfgCombo(const char* _name, int _value, int _counts)
+        : THSetting(_name, _value)
+    {
+        counts = _counts;
+        Check(_value);
+    }
+    void Check(int def = 0)
+    {
+        if (value < 0 || value >= counts) {
+            value = def;
+        }
+    }
+    void SetCounts(int cnt)
+    {
+        counts = cnt;
+        if (value < 0)
+            value = 0;
+        if (value >= cnt)
+            value = cnt-1;
+    }
+    virtual void Set(int& _value) override
+    {
+        value = _value;
+        LauncherSettingSet(name.c_str(), value);
+        Check();
+    }
+    bool Gui(const char* guiTxt, const char* guiCombo, const char* helpTxt = nullptr)
+    {
+        ImGui::TextUnformatted(guiTxt);
+        ImGui::SameLine();
+        std::string txtTmp = "##";
+        txtTmp += guiTxt;
+        ImGui::PushItemWidth(620.0f - ImGui::GetWindowSize().x);
+        auto result = ImGui::Combo(txtTmp.c_str(), &value, guiCombo);
+        ImGui::PopItemWidth();
+        if (result) {
+            LauncherSettingSet(name.c_str(), value);
+        }
+        if (helpTxt) {
+            ImGui::SameLine();
+            HelpMarker(helpTxt);
+        }
+        return result;
+    }
+
+private:
+    int counts;
+};
+
+class THCfgGui {
+private:
+    THCfgGui()
+    {
+        mGuiUpdFunc = [&]() { GuiMain(); };
+        CfgInit();
+        for (auto& game : gGameRoll) {
+            mThcrapGames[game.type].push_back(game);
+        }
+    }
+    SINGLETON(THCfgGui)
+
+public:
+    void GuiUpdate()
+    {
+        mGuiUpdFunc();
+    }
+
+    void FileOperateWrapper(FILEOP_FLAGS op, const wchar_t* from, const wchar_t* to)
+    {
+        SHFILEOPSTRUCTW fileStruct = {};
+        fileStruct.hwnd = 0;
+        fileStruct.wFunc = op;
+        fileStruct.pFrom = from;
+        fileStruct.pTo = to;
+        fileStruct.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_NOCONFIRMMKDIR;
+        SHFileOperationW(&fileStruct);
+    }
+    void LauncherCfgReset()
+    {
+        LauncherCfgClose();
+        if (mCfgResetFlag == 1) {
+            wchar_t appDataPath[MAX_PATH];
+            if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath) == S_OK) {
+                std::wstring jsonPath = appDataPath;
+                jsonPath += L"\\thprac";
+                jsonPath += L"\\thpracP.json";
+                DeleteFileW(jsonPath.c_str());
+            }
+        } else if (mCfgResetFlag == 2) {
+            if (mCfgUseLocalDir != gCfgIsLocalDir) {
+                wchar_t appDataPath[MAX_PATH] {};
+                if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath) != S_OK) {
+                    return;
+                }
+                std::wstring globalPath = appDataPath;
+                globalPath += L"\\thprac";
+                globalPath.push_back('\0');
+                globalPath.push_back('\0');
+                std::wstring localPath = ExtensionInstallDirectory();
+
+                if (!gCfgIsLocalDir) {
+                    auto dest = localPath + L".thprac_data";
+                    dest.push_back('\0');
+                    dest.push_back('\0');
+                    if (mCfgDirChgGlobalParam == 1 || mCfgDirChgGlobalParam == 2) {
+                        FileOperateWrapper(FO_DELETE, dest.c_str(), nullptr);
+                        FileOperateWrapper(mCfgDirChgGlobalParam == 1 ? FO_MOVE : FO_COPY, globalPath.c_str(), dest.c_str());
+                    } else if (mCfgDirChgLocalParam == 1) {
+                        auto src = localPath + L".thprac_data_backup";
+                        MoveFileW(src.c_str(), dest.c_str());
+                    } else if (mCfgDirChgLocalParam == 0) {
+                        CreateDirectoryW(dest.c_str(), nullptr);
+                    }
+                } else {
+                    auto src = localPath + L".thprac_data";
+                    src.push_back('\0');
+                    src.push_back('\0');
+                    if (mCfgDirChgLocalParam == 0) {
+                        auto dest = localPath + L".thprac_data_backup";
+                        MoveFileW(src.c_str(), dest.c_str());
+                    } else if (mCfgDirChgLocalParam == 1 || mCfgDirChgLocalParam == 2) {
+                        if (mCfgDirChgLocalParam == 1) {
+                            FileOperateWrapper(FO_DELETE, globalPath.c_str(), nullptr);
+                        }
+                        FileOperateWrapper(mCfgDirChgLocalParam == 1 ? FO_MOVE : FO_DELETE, src.c_str(), mCfgDirChgLocalParam == 1 ? globalPath.c_str() : nullptr);
+                    }
+                }
+            }
+
+            if (LauncherCfgInit()) {
+                bool useRelPath = mCfgRelativePath && gCfgIsLocalDir;
+                LauncherSettingSet("use_relative_path", useRelPath);
+                LauncherGamesForceReload();
+                LauncherCfgClose();
+            }
+        }
+        mCfgResetFlag = 0;
+    }
+
+private:
+    bool themeIsUser;
+    struct utf8_utf16 {
+        const char* utf8;
+        const wchar_t* utf16;
+    };
+    std::vector<utf8_utf16> userThemes;
+    size_t userThemeIdx = 0;
+
+    void CfgInit()
+    {
+        int language = Gui::LocaleGet();
+        mCfgLanguage.Set(language);
+        mOriginalLanguage = mCfgLanguage.Get();
+        UpdateThemesList();
+
+        if ((unsigned int)mCfgTheme.Get() > 2) {
+            // I use the fact that THCfgCombo::Set (due to how THSetting::Set works)
+            // only accepts references as an excuse to call this variable a funny
+            int Sus = 1;
+            bool configThemeExists = false;
+            const char* cur_theme = nullptr;
+            if (!LauncherSettingGet("theme_user", cur_theme)) {
+                mCfgTheme.Set(Sus);
+                return;
+            }
+            for (size_t i = 0; i < userThemes.size(); i++) {
+                if (!strcmp(userThemes[i].utf8, cur_theme)) {
+                    userThemeIdx = i;
+                    configThemeExists = true;
+                    break;
+                }
+            }
+            if (!configThemeExists) {
+                mCfgTheme.Set(Sus);
+            }
+        }
+    }
+    void KeyBindSettings()
+    {
+        bool confirmModalFlag = false;
+        LauncherSettingGet_KeyBind();
+
+        if (ImGui::Button(S(THPRAC_KEYBIND))) {
+            ImGui::OpenPopup(S(THPRAC_KEYBIND_MODAL));
+        }
+
+        if (GuiModal(S(THPRAC_KEYBIND_MODAL), { LauncherWndGetSize().x * 0.95f, LauncherWndGetSize().y * 0.8f })) {
+            ImGui::PushTextWrapPos(LauncherWndGetSize().x * 0.9f);
+            {
+                ImGui::TextUnformatted(S(THPRAC_KEYBIND));
+                ImGui::BeginTable("keys binded", 3, ImGuiTableFlags_::ImGuiTableFlags_Borders);
+                ImGui::TableSetupColumn(S(THPRAC_KEYBIND_FROM), 0, LauncherWndGetSize().x * 0.95f * 0.4f);
+                ImGui::TableSetupColumn(S(THPRAC_KEYBIND_TO), 0, LauncherWndGetSize().x * 0.95f * 0.4f);
+                ImGui::TableSetupColumn(S(THPRAC_KEYBIND_REMOVE), 0, LauncherWndGetSize().x * 0.95f * 0.2f);
+                ImGui::TableHeadersRow();
+
+                int row = 0;
+                bool is_to_remove = false;
+                KeyDefine key_to_remove = { 0 };
+                for (auto& bind : g_keybind) {
+                    auto key1 = bind.first.keyname;
+                    auto key2 = bind.second.keyname;
+                    ImGui::TableNextColumn();
+                    ImGui::Text(key1.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text(key2.c_str());
+                    ImGui::TableNextColumn();
+                    char btn_name[100];
+                    sprintf_s(btn_name, "%s##%d", S(THPRAC_KEYBIND_REMOVE), row);
+                    if (ImGui::Button(btn_name)) {
+                        is_to_remove = true;
+                        key_to_remove = bind.first;
+                    }
+                    row++;
+                }
+                ImGui::EndTable();
+                if (is_to_remove) {
+                    g_keybind.erase(key_to_remove);
+                    LauncherSettingSet_KeyBind();
+                }
+
+                static int keyid_from = 0;
+                static int keyid_to = 0;
+                static const char* keys_name[109] = { 0 };
+                if (keys_name[0] == nullptr) {
+                    int i = 0;
+                    for (auto& key : keyBindDefine) {
+                        keys_name[i] = key.keyname.c_str();
+                        i++;
+                    }
+                }
+                static bool press_a_key_from = false;
+                static bool press_a_key_to = false;
+                if (ImGui::Button(S(THPRAC_KEYBIND_ADD))) {
+                    ImGui::OpenPopup(S(THPRAC_KEYBIND_ADD_MODAL));
+                    keyid_from = 0;
+                    keyid_to = 0;
+                    press_a_key_from = false;
+                    press_a_key_to = false;
+                }
+                if (GuiModal(S(THPRAC_KEYBIND_ADD_MODAL), { LauncherWndGetSize().x * 0.7f, LauncherWndGetSize().y * 0.7f })) {
+                    ImGui::PushTextWrapPos(LauncherWndGetSize().x * 0.9f);
+                    {
+                        ImGui::Combo(S(THPRAC_KEYBIND_FROM_COMBO), &keyid_from, keys_name, 109);
+                        ImGui::SameLine();
+                        char press_key_text[100] = { 0 };
+                        sprintf_s(press_key_text, "%s##%d", S(THPRAC_KEYBIND_PRESS_A_KEY), 1);
+                        if (ImGui::Button(press_key_text) && !press_a_key_from && !press_a_key_to) {
+                            press_a_key_from = true;
+                        }
+                        ImGui::Combo(S(THPRAC_KEYBIND_TO_COMBO), &keyid_to, keys_name, 109);
+                        ImGui::SameLine();
+                        sprintf_s(press_key_text, "%s##%d", S(THPRAC_KEYBIND_PRESS_A_KEY), 2);
+                        if (ImGui::Button(press_key_text) && !press_a_key_from && !press_a_key_to) {
+                            press_a_key_to = true;
+                        }
+                        if (press_a_key_from || press_a_key_to) {
+                            ImGui::Text(S(THPRAC_KEYBIND_PRESS_A_KEY));
+                            int key_id = -1;
+                            for (int i = 0; i < 109; i++) {
+                                auto key_state = GetAsyncKeyState(keyBindDefine[i].vk);
+                                if (key_state & 0x8000) {
+                                    key_id = i;
+                                    break;
+                                }
+                            }
+                            if (key_id != -1) {
+                                if (press_a_key_from) {
+                                    keyid_from = key_id;
+                                } else if (press_a_key_to) {
+                                    keyid_to = key_id;
+                                }
+                                press_a_key_from = press_a_key_to = false;
+                            }
+                        }
+                    }
+                    auto retnValue = GuiCornerButton(S(THPRAC_APPLY), S(THPRAC_CANCEL), ImVec2(1.0f, 0.0f), true);
+                    if (retnValue == 1) {
+                        g_keybind[keyBindDefine[keyid_from]] = keyBindDefine[keyid_to];
+                        ImGui::CloseCurrentPopup();
+                    } else if (retnValue == 2) {
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndPopup();
+                }
+            }
+
+            auto retnValue = GuiCornerButton(S(THPRAC_APPLY), nullptr, ImVec2(1.0f, 0.0f), true);
+            if (retnValue == 1) {
+                ImGui::CloseCurrentPopup();
+                LauncherSettingSet_KeyBind();
+                confirmModalFlag = true;
+            } else if (retnValue == 2) {
+                ImGui::CloseCurrentPopup();
+                confirmModalFlag = false;
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::EndPopup();
+        }
+    }
+
+    void PathAndDirSettings()
+    {
+        bool dirSettingModalFlag = false;
+        bool confirmModalFlag = false;
+
+        if (ImGui::Button(S(THPRAC_DIRECTORY_SETTING))) {
+            ImGui::OpenPopup(S(THPRAC_DIRECTORY_SETTING_MODAL));
+            mCfgUseLocalDir = gCfgIsLocalDir;
+            mCfgDirChgGlobalParam = 0;
+            mCfgDirChgLocalParam = 0;
+            mCfgRelativePath = mUseRelativePath.Get();
+        }
+
+        // Fixed width, auto height: letting this one auto-fit its width made the
+        // long description stretch the dialog to the full window width, and the
+        // 应用/取消 buttons then sat outside the window. 34 font units is wide
+        // enough for the widest radio row at every UI scale.
+        if (GuiModal(S(THPRAC_DIRECTORY_SETTING_MODAL), ImVec2(ImGui::GetFontSize() * 34.0f, 0.0f))) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(S(THPRAC_DIRECTORY_SETTING_DESC));
+            ImGui::NewLine();
+
+            ImGui::RadioButton(S(THPRAC_DIR_GLOBAL), &mCfgUseLocalDir, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton((S(THPRAC_DIR_LOCAL)), &mCfgUseLocalDir, 1);
+            ImGui::SameLine();
+            if (mCfgUseLocalDir == 1) {
+                ImGui::Checkbox(S(THPRAC_USE_REL_PATH), &mCfgRelativePath);
+            } else {
+                ImGui::BeginDisabled();
+                ImGui::Checkbox(S(THPRAC_USE_REL_PATH), &mCfgRelativePath);
+                ImGui::EndDisabled();
+            }
+
+            if (gCfgIsLocalDir == mCfgUseLocalDir) {
+                ImGui::BeginDisabled();
+            }
+            if (!gCfgIsLocalDir) {
+                ImGui::TextUnformatted(S(THPRAC_EXISTING_GLOBAL_DATA));
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_IGNORE_GLOBAL_DATA), &mCfgDirChgGlobalParam, 0);
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_MOVE_TO_LOCAL), &mCfgDirChgGlobalParam, 1);
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_COPY_TO_LOCAL), &mCfgDirChgGlobalParam, 2);
+
+                ImGui::TextUnformatted(S(THPRAC_EXISTING_LOCAL_DATA));
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_IGNORE_LOCAL_DATA), &mCfgDirChgLocalParam, 0);
+                ImGui::SameLine();
+                if (gCfgIsLocalDir != mCfgUseLocalDir && !gCfgLocalBackupAvaliable) {
+                    ImGui::BeginDisabled();
+                }
+                ImGui::RadioButton(S(THPRAC_USE_BACKUP_DATA), &mCfgDirChgLocalParam, 1);
+                if (gCfgIsLocalDir != mCfgUseLocalDir && !gCfgLocalBackupAvaliable) {
+                    ImGui::EndDisabled();
+                }
+                ImGui::SameLine();
+                ImGui::BeginDisabled();
+                ImGui::RadioButton(S(THPRAC_OVERWRTITE_DATA), &mCfgDirChgLocalParam, 2);
+                ImGui::EndDisabled();
+                if (mCfgDirChgGlobalParam == 1 || mCfgDirChgGlobalParam == 2) {
+                    mCfgDirChgLocalParam = 2;
+                } else if (mCfgDirChgLocalParam == 2) {
+                    mCfgDirChgLocalParam = 0;
+                }
+            } else {
+
+                ImGui::TextUnformatted(S(THPRAC_EXISTING_GLOBAL_DATA));
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_IGNORE_GLOBAL_DATA), &mCfgDirChgGlobalParam, 0);
+                ImGui::SameLine();
+                if (gCfgIsLocalDir != mCfgUseLocalDir) {
+                    ImGui::BeginDisabled();
+                }
+                ImGui::RadioButton(S(THPRAC_OVERWRTITE_DATA), &mCfgDirChgGlobalParam, 1);
+                if (gCfgIsLocalDir != mCfgUseLocalDir) {
+                    ImGui::EndDisabled();
+                }
+                if (mCfgDirChgLocalParam == 1) {
+                    mCfgDirChgGlobalParam = 1;
+                } else if (mCfgDirChgGlobalParam == 1) {
+                    mCfgDirChgGlobalParam = 0;
+                }
+
+                ImGui::TextUnformatted(S(THPRAC_EXISTING_LOCAL_DATA));
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_CREATE_BACKUP_DATA), &mCfgDirChgLocalParam, 0);
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_MOVE_TO_GLOBAL), &mCfgDirChgLocalParam, 1);
+                ImGui::SameLine();
+                ImGui::RadioButton(S(THPRAC_PURGE_LOCAL), &mCfgDirChgLocalParam, 2);
+            }
+            if (gCfgIsLocalDir == mCfgUseLocalDir) {
+                ImGui::EndDisabled();
+            }
+
+            if (gCfgIsLocalDir == mCfgUseLocalDir && mCfgRelativePath == mUseRelativePath.Get()) {
+                if (GuiCornerButton(S(THPRAC_CANCEL), nullptr, ImVec2(1.0f, 0.0f), true)) {
+                    ImGui::CloseCurrentPopup();
+                }
+            } else {
+                auto retnValue = GuiCornerButton(S(THPRAC_APPLY), S(THPRAC_CANCEL), ImVec2(1.0f, 0.0f), true);
+                if (retnValue == 1) {
+                    ImGui::CloseCurrentPopup();
+                    confirmModalFlag = true;
+                } else if (retnValue == 2) {
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+
+            ImGui::PopTextWrapPos();
+            ImGui::EndPopup();
+        }
+
+        if (confirmModalFlag) {
+            ImGui::OpenPopup(S(THPRAC_DIRECTORY_CONFIRM));
+        }
+        if (GuiModal(S(THPRAC_DIRECTORY_CONFIRM))) {
+            ImGui::TextUnformatted(S(THPRAC_DIRECTORY_CONFIRM_DESC));
+            auto buttonSize = ImGui::GetItemRectSize().x / 2.05f;
+            if (ImGui::Button(S(THPRAC_YES), ImVec2(buttonSize, 0))) {
+                GuiLauncherMainTrigger(LAUNCHER_RESET);
+                mCfgResetFlag = 2;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(S(THPRAC_NO), ImVec2(buttonSize, 0))) {
+                dirSettingModalFlag = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        if (dirSettingModalFlag) {
+            ImGui::OpenPopup(S(THPRAC_DIRECTORY_SETTING_MODAL));
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button(S(THPRAC_DATADIR_OPEN))) {
+            ShellExecuteW(nullptr, L"open", LauncherGetDataDir().c_str(), nullptr, nullptr, SW_SHOW);
+        }
+
+        ImGui::SameLine();
+        if (GuiButtonAndModalYesNo(S(THPRAC_RESET_LAUNCHER), S(THPRAC_RESET_LAUNCHER_MODAL), S(THPRAC_RESET_LAUNCHER_WARNING), -1.0f, S(THPRAC_YES), S(THPRAC_NO))) {
+            GuiLauncherMainTrigger(LAUNCHER_RESET);
+            mCfgResetFlag = 1;
+        }
+    }
+
+    bool GuiGameTypeChkBox(const char* text, int idx)
+    {
+        bool result = ImGui::Checkbox(text, &(mGameTypeOpt[idx]));
+        if (result) {
+            if (!idx) {
+                for (auto& cfg : mThcrapCfg) {
+                    cfg.second = mGameTypeOpt[idx];
+                }
+            } else {
+                for (auto& game : mThcrapGames[idx]) {
+                    if (game.playerSelect) {
+                        game.selected = mGameTypeOpt[idx];
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    void GuiThcrapBatchAddWnd()
+    {
+        if (ImGui::Button(S(THPRAC_BACK))) {
+            mGuiUpdFunc = [&]() { GuiMain(); };
+        }
+        ImGui::SameLine();
+        GuiCenteredText(S(THPRAC_THCRAP_ADDCFG_CHILD));
+        ImGui::Separator();
+
+        ImGui::BeginChild("BATCH_ADD");
+
+        bool itemChanged = false;
+        auto childHeight = std::max(ImGui::GetWindowHeight() * 0.37f, ImGui::GetFontSize() * 10.5f);
+
+        ImGui::TextUnformatted(S(THPRAC_THCRAP_ADDCFG_CONFIGS));
+        ImGui::BeginChild("BATCH_ADD_CFG", ImVec2(0, childHeight), true);
+        ImGui::Columns(3, 0, false);
+        bool allCfgSelected = true;
+        for (auto& cfg : mThcrapCfg) {
+            auto txtSize = ImGui::CalcTextSize(cfg.first.c_str());
+            itemChanged |= ImGui::Checkbox(cfg.first.c_str(), &cfg.second);
+            if (ImGui::IsItemHovered() && txtSize.x > ImGui::GetWindowWidth() * 0.3f) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 25.0f);
+                ImGui::TextUnformatted(cfg.first.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            if (!cfg.second) {
+                allCfgSelected = false;
+            }
+            mGameTypeOpt[0] = allCfgSelected;
+            ImGui::NextColumn();
+        }
+        ImGui::Columns(1);
+        ImGui::EndChild();
+
+        ImGui::TextUnformatted(S(THPRAC_THCRAP_ADDCFG_GAMES));
+        ImGui::BeginChild("BATCH_ADD_GAMES", ImVec2(0, childHeight), true);
+        int i = 0;
+        for (auto& gameType : mThcrapGames) {
+            if (i) {
+                bool allSelected = true;
+                bool allUnavailable = true;
+                ImGui::Columns(i == 1 ? 7 : 6, 0, false);
+                for (auto& game : gameType) {
+                    if (game.playerSelect) {
+                        allUnavailable = false;
+                        itemChanged |= ImGui::Checkbox(game.name, &game.selected);
+                        if (!game.selected) {
+                            allSelected = false;
+                        }
+                    } else {
+                        ImGui::BeginDisabled();
+                        ImGui::Checkbox(game.name, &game.selected);
+                        ImGui::EndDisabled();
+                    }
+                    mGameTypeOpt[i] = allSelected;
+                    ImGui::NextColumn();
+                }
+                if (allUnavailable) {
+                    mGameTypeOpt[i] = false;
+                }
+                ImGui::Columns(1);
+                if (i != 3) {
+                    ImGui::NewLine();
+                }
+            }
+            ++i;
+        }
+        ImGui::EndChild();
+        ImGui::Indent(ImGui::GetStyle().ItemSpacing.x);
+        itemChanged |= GuiGameTypeChkBox(S(THPRAC_THCRAP_ADDCFG_ALLCFG), 0);
+        ImGui::SameLine();
+        itemChanged |= GuiGameTypeChkBox(S(THPRAC_GAMES_MAIN_SERIES), 1);
+        ImGui::SameLine();
+        itemChanged |= GuiGameTypeChkBox(S(THPRAC_GAMES_SPINOFF_STG), 2);
+        ImGui::SameLine();
+        itemChanged |= GuiGameTypeChkBox(S(THPRAC_GAMES_SPINOFF_OTHERS), 3);
+        ImGui::Unindent(ImGui::GetStyle().ItemSpacing.x);
+
+        if (itemChanged) {
+            mThcrapAddPromptTime = 0.0f;
+        }
+        if (mThcrapAddPromptTime > 0.0f) {
+            ImGui::PushStyleColor(ImGuiCol_Button, mThcrapAddPromptCol);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, mThcrapAddPromptCol);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, mThcrapAddPromptCol);
+            mThcrapAddPromptTime -= ImGui::GetIO().DeltaTime;
+            GuiCornerButton(mThcrapAddPrompt.c_str(), nullptr, ImVec2(1.0f, 0.0f), true);
+            ImGui::PopStyleColor();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleColor();
+        } else {
+            auto retnValue = GuiCornerButton(S(THPRAC_APPLY), nullptr, ImVec2(1.0f, 0.0f), true);
+            if (retnValue == 1) {
+                size_t cfgSize = 0;
+                size_t gameSize = 0;
+                for (auto& cfg : mThcrapCfg) {
+                    if (cfg.second) {
+                        cfgSize++;
+                        for (auto& gameType : mThcrapGames) {
+                            for (auto& game : gameType) {
+                                if (game.playerSelect && game.selected) {
+                                    gameSize++;
+                                    LauncherGamesThcrapAdd(game.name, cfg.first, mCfgThpracDefault.Get());
+                                }
+                            }
+                        }
+                    }
+                }
+                LauncherGamesThcrapAdd("", std::string(), false, true);
+                mThcrapAddPromptTime = 2.0f;
+                if (!cfgSize) {
+                    mThcrapAddPrompt = S(THPRAC_THCRAP_ADDCFG_NOCFG);
+                    mThcrapAddPromptCol = { 0.8f, 0.0f, 0.0f, 1.0f };
+                } else if (!gameSize) {
+                    mThcrapAddPrompt = S(THPRAC_THCRAP_ADDCFG_NOGAME);
+                    mThcrapAddPromptCol = { 0.8f, 0.0f, 0.0f, 1.0f };
+                } else {
+                    mThcrapAddPrompt = S(THPRAC_THCRAP_ADDCFG_SUCCESS);
+                    mThcrapAddPromptCol = { 0.0f, 0.75f, 0.0f, 1.0f };
+                }
+            }
+        }
+
+        ImGui::EndChild();
+    }
+    void GuiThcrapSettings()
+    {
+        if (mThcrap.Get() == "") {
+            ImGui::TextUnformatted(S(THPRAC_THCRAP_NOTYET));
+            if (ImGui::Button("Get thcrap")) {
+                ShellExecuteW(nullptr, L"open", L"https://www.thpatch.net/", nullptr, nullptr, SW_SHOW);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(S(THPRAC_THCRAP_SET))) {
+                auto path = LauncherWndFolderSelect();
+                if (path != L"") {
+                    if (!LauncherGamesThcrapTest(path)) {
+                        mThcrapHintTimeBuffer = 2;
+                        mThcrapHintTime = 5.0f;
+                        mThcrapHintStr = S(THPRAC_THCRAP_INVALID);
+                    } else {
+                        mThcrap.Set(utf16_to_utf8(path.c_str()));
+                        LauncherGamesThcrapSetup();
+                        mThcrapHintTime = 0.0f;
+                    }
+                }
+            }
+        } else {
+            ImGui::Text(S(THPRAC_THCRAP_LOCATION), mThcrap.Get().c_str());
+            if (GuiButtonAndModalYesNo(S(THPRAC_THCRAP_UNSET), S(THPRAC_THCRAP_UNSET_MODAL), S(THPRAC_THCRAP_UNSET_TXT), -1.0f, S(THPRAC_YES), S(THPRAC_NO))) {
+                mThcrap.Set(std::string(""));
+                mThcrapHintTime = 0.0f;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(S(THPRAC_THCRAP_ADDCFG))) {
+                LauncherGamesThcrapSetup();
+                LauncherGamesThcrapCfgGet(mThcrapCfg, mThcrapGames);
+                if (mThcrapCfg.size()) {
+                    mGuiUpdFunc = [&]() { GuiThcrapBatchAddWnd(); };
+                } else {
+                    mThcrapHintTimeBuffer = 2;
+                    mThcrapHintTime = 5.0f;
+                    mThcrapHintStr = S(THPRAC_THCRAP_ADDCFG_404);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(S(THPRAC_THCRAP_LAUNCH_CONFIGURE))) {
+                if (!LauncherGamesThcrapLaunch()) {
+                    mThcrapHintTimeBuffer = 2;
+                    mThcrapHintTime = 5.0f;
+                    mThcrapHintStr = S(THPRAC_THCRAP_LAUNCH_FAILED);
+                }
+            }
+        }
+        if (mThcrapHintTimeBuffer) {
+            mThcrapHintTimeBuffer--;
+        } else if (mThcrapHintTime > 0.0f) {
+            mThcrapHintTime -= ImGui::GetIO().DeltaTime;
+            ImGui::SameLine();
+            ImGui::TextUnformatted(mThcrapHintStr.c_str());
+        }
+    }
+
+    // Function for displaying a row for the rebind and also rebinding it
+    bool GuiHotkeyEdit(const char* label, const char* binding, bool* listening, bool block_input, bool identical_binding, const char* tooltip = "")
+    {
+        // ImGuiIO& io = ImGui::GetIO();
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        if (tooltip[0] != '\0') {
+            ImGui::TextUnformatted("(?)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(tooltip);
+                ImGui::EndTooltip();
+            }
+            ImGui::SameLine();
+        }
+        // Visual button that toggles listening
+        ImGui::PushID(label);
+        int current_chord = 0;
+        LauncherSettingGet(binding, current_chord);
+        std::string current_string = Gui::HotkeyChordToLabel(current_chord);
+        if (!*listening) {
+            if (ImGui::Button(current_string.c_str()) && !block_input)
+                *listening = true;
+        } else {
+            // Show recording state
+            if (ImGui::Button(S(THPRAC_HOTKEY_CANCEL)))
+                *listening = false; // cancel on click
+        }
+
+        // Show warning if Ctrl or Shift is used as they can interfere with other functionality or the game itself
+        if (current_chord & ((1 << Gui::ChordKey_Ctrl) + (1 << Gui::ChordKey_Shift))) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted("(*)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(S(THPRAC_HOTKEY_MODIFIER_WARNING));
+                ImGui::EndTooltip();
+            }
+        }
+
+        // Show warning if there's overlap in bindings
+        if (identical_binding) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted("(!)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(S(THPRAC_HOTKEY_SUBMASK_WARNING));
+                ImGui::EndTooltip();
+            }
+        }
+
+        bool changed = false;
+
+        if (*listening) {
+            ImGui::SetItemDefaultFocus();
+
+            int chord = 0;
+
+            // Scan for keys until the keyboard keys which are not supported
+            // Keyboard
+            for (int key = 0; key < Gui::ChordKey_KEYBOARD_COUNT; ++key) {
+                // Register key if held or released.  If released, end the combo
+                if (ImGui::IsKeyDown(Gui::HotkeyChordToVK(key))) {
+                    chord |= 1 << key;
+                } else if (ImGui::IsKeyReleased(Gui::HotkeyChordToVK(key))) {
+                    chord |= 1 << key;
+                    changed = true;
+                }
+            }
+            // Controller
+            for (int key = Gui::ChordKey_KEYBOARD_COUNT; key < Gui::ChordKey_COUNT; ++key) {
+                // Register key if held or released.  If released, end the combo
+                if (ImGui::IsKeyDown(Gui::HotkeyChordToVK(key))) {
+                    chord |= 1 << key;
+                } else if (ImGui::IsKeyReleased(Gui::HotkeyChordToVK(key))) {
+                    chord |= 1 << key;
+                    changed = true;
+                }
+            }
+
+            // Update
+            if (changed) {
+                LauncherSettingSet(binding, chord);
+                *listening = false;
+            }
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    // Function for drawing the entire submenu
+    void GuiHotkeySettings()
+    {
+        // ImGui::TextUnformatted(S(THPRAC_SETTING_HOTKEYS));
+        // ImGui::Separator();
+        ImGui::TextUnformatted(S(THPRAC_HOTKEY_TOOLTIP));
+        ImGui::TextUnformatted("*");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(S(THPRAC_HOTKEY_MODIFIER_WARNING));
+        // Check for submasks
+        bool quick_menu_binding_shared = false;
+        bool advanced_menu_binding_shared = false;
+        bool screenshot_binding_shared = false;
+        bool language_binding_shared = false;
+        int backspace_chord = 0;
+        int advanced_chord = 0;
+        int screenshot_chord = 0;
+        int language_chord = 0;
+        LauncherSettingGet("backspace_menu_chord", backspace_chord);
+        LauncherSettingGet("advanced_menu_chord", advanced_chord);
+        LauncherSettingGet("screenshot_chord", screenshot_chord);
+        LauncherSettingGet("language_chord", language_chord);
+
+        // Checks if any chord is a sub-chord of another to throw a warning to the user
+        // Backspace and F12 menu shared
+        if ((advanced_chord & backspace_chord) == advanced_chord || (advanced_chord & backspace_chord) == backspace_chord) {
+            quick_menu_binding_shared = true;
+            advanced_menu_binding_shared = true;
+        }
+        // Backspace menu and Screenshot shared
+        if ((screenshot_chord & backspace_chord) == screenshot_chord || (screenshot_chord & backspace_chord) == backspace_chord) {
+            quick_menu_binding_shared = true;
+            screenshot_binding_shared = true;
+        }
+        // F12 menu and Screenshot shared
+        if ((advanced_chord & screenshot_chord) == advanced_chord || (advanced_chord & screenshot_chord) == screenshot_chord) {
+            advanced_menu_binding_shared = true;
+            screenshot_binding_shared = true;
+        }
+
+        // Because Language also requires pressing a number key, it being a sub-chord of another chord
+        // does not matter, unless it is the same value in which case the other chord would be the
+        // sub-chord of the Language chord.
+
+        // Backspace menu and Language shared
+        if ((language_chord & backspace_chord) == backspace_chord) {
+            quick_menu_binding_shared = true;
+            language_binding_shared = true;
+        }
+        // F12 menu and Language shared
+        if ((language_chord & advanced_chord) == advanced_chord) {
+            advanced_menu_binding_shared = true;
+            language_binding_shared = true;
+        }
+        // Screenshot menu and Language shared
+        if ((language_chord & screenshot_chord) == screenshot_chord) {
+            screenshot_binding_shared = true;
+            language_binding_shared = true;
+        }
+        // Check if other inputs are listening and block if so.
+        // This is kinda getting out of hand, best hope not many more hotkeys are needed anymore.
+        bool block_backspace_menu = mHotkeyF12MenuListening || mHotkeyScreenshotListening || mHotkeyLanguageListening;
+        bool block_advanced_menu = mHotkeyBackspaceMenuListening || mHotkeyScreenshotListening || mHotkeyLanguageListening;
+        bool block_screenshot = mHotkeyBackspaceMenuListening || mHotkeyF12MenuListening || mHotkeyLanguageListening;
+        bool block_language = mHotkeyBackspaceMenuListening || mHotkeyF12MenuListening || mHotkeyScreenshotListening;
+
+        // Add the buttons to the UI and update data if sucessfully updated.
+        GuiHotkeyEdit(S(THPRAC_HOTKEY_QUICK_SETTINGS), "backspace_menu_chord", &mHotkeyBackspaceMenuListening, block_backspace_menu, quick_menu_binding_shared);
+        GuiHotkeyEdit(S(THPRAC_HOTKEY_ADVANCED_SETTINGS), "advanced_menu_chord", &mHotkeyF12MenuListening, block_advanced_menu, advanced_menu_binding_shared);
+        GuiHotkeyEdit(S(THPRAC_HOTKEY_SCREENSHOT), "screenshot_chord", &mHotkeyScreenshotListening, block_screenshot, screenshot_binding_shared);
+        GuiHotkeyEdit(S(THPRAC_HOTKEY_LANGUAGE_SETTINGS), "language_chord", &mHotkeyLanguageListening, block_language, language_binding_shared, S(THPRAC_HOTKEY_LANGUAGE_TOOLTIP));
+
+        // Reset button
+        if (ImGui::Button(S(THPRAC_HOTKEY_RESET))) {
+            mHotkeyBackspaceMenuListening = false;
+            mHotkeyF12MenuListening = false;
+            mHotkeyScreenshotListening = false;
+            mHotkeyLanguageListening = false;
+            int backspace_menu_chord_r = 1 << Gui::ChordKey_Backspace;
+            int advanced_menu_chord_r = 1 << Gui::ChordKey_F12;
+            int screenshot_chord_r = 1 << Gui::ChordKey_Home;
+            int language_chord_r = 1 << Gui::ChordKey_Alt;
+            LauncherSettingSet("backspace_menu_chord", backspace_menu_chord_r);
+            LauncherSettingSet("advanced_menu_chord", advanced_menu_chord_r);
+            LauncherSettingSet("screenshot_chord", screenshot_chord_r);
+            LauncherSettingSet("language_chord", language_chord_r);
+        }
+    }
+
+    bool GuiLive2DHotkeyEdit(const char* label, const char* binding,bool is_vk, bool* listening, bool block_input, const char* tooltip = "")
+    {
+        // ImGuiIO& io = ImGui::GetIO();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        if (tooltip[0] != '\0') {
+            ImGui::TextUnformatted("(?)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(tooltip);
+                ImGui::EndTooltip();
+            }
+            ImGui::SameLine();
+        }
+        // Visual button that toggles listening
+        ImGui::PushID(label);
+
+        int current_key_id = -1;
+        LauncherSettingGet(binding, current_key_id);
+
+        std::string current_string = "None";
+        for (int i = 0; i < ARRAYSIZE(keyBindDefine); i++)
+        {
+            if (is_vk)
+            {
+                if (keyBindDefine[i].vk == current_key_id) {
+                    current_string = keyBindDefine[i].keyname;
+                    break;
+                }
+            }
+            else
+            {
+                if (keyBindDefine[i].dik == current_key_id) {
+                    current_string = keyBindDefine[i].keyname;
+                    break;
+                }
+            }
+        }
+        
+        if (!*listening) {
+            if (ImGui::Button(current_string.c_str()) && !block_input)
+                *listening = true;
+        } else {
+            // Show recording state
+            if (ImGui::Button(S(THPRAC_HOTKEY_CANCEL)))
+                *listening = false; // cancel on click
+        }
+        
+        bool changed = false;
+        if (*listening) {
+            ImGui::SetItemDefaultFocus();
+
+            int vk = 0;
+            for (int key = 0; key < ARRAYSIZE(keyBindDefine); ++key) {
+                if (ImGui::IsKeyDown(keyBindDefine[key].vk)) {
+                    vk = keyBindDefine[key].vk;
+                    changed = true;
+                }
+            }
+
+            // Update
+            if (changed) {
+                if (vk == VK_ESCAPE)
+                {
+                    int invalid = -1;
+                    LauncherSettingSet(binding, invalid); // set to NONE
+                }
+                else
+                {
+                    if (is_vk)
+                    {
+                        LauncherSettingSet(binding, vk);
+                    }
+                    else
+                    {
+                        int dik = -1;
+                        for (int i = 0; i < ARRAYSIZE(keyBindDefine); i++) {
+                             if (keyBindDefine[i].vk == vk) {
+                                 dik = keyBindDefine[i].dik;
+                                 break;
+                             }
+                        }
+                        LauncherSettingSet(binding, dik);
+                    }
+                }
+                *listening = false;
+            }
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+
+    void TextLink(const char* text, const wchar_t* link)
+    {
+        ImGui::TextUnformatted(text);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(0)) {
+                ShellExecuteW(nullptr, nullptr, link, nullptr, nullptr, SW_SHOW);
+            }
+        }
+    }
+    void GuiLicenceWnd()
+    {
+        if (ImGui::Button(S(THPRAC_BACK))) {
+            mGuiUpdFunc = [&]() { GuiMain(); };
+        }
+        ImGui::SameLine();
+        GuiCenteredText("COPYING");
+        ImGui::Separator();
+        ImGui::BeginChild("COPYING_INFO");
+        Gui::ShowLicenceInfo();
+        ImGui::EndChild();
+    }
+
+    void UpdateThemesList()
+    {
+        for (const auto& file : userThemes) {
+            if (file.utf8)
+                free((void*)file.utf8);
+            if (file.utf16)
+                free((void*)file.utf16);
+        }
+        userThemes = {};
+        WIN32_FIND_DATAW find;
+        HANDLE hFind = FindFirstFileW((LauncherGetDataDir() + L"themes\\*.json").c_str(), &find);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                userThemes.push_back({ _strdup(utf16_to_utf8(find.cFileName).c_str()), _wcsdup(find.cFileName) });
+            } while (FindNextFileW(hFind, &find));
+        }
+    }
+
+    void GuiMain()
+    {
+        static int category = 0;
+        const char* categories[] = {
+            Gui::DesignText("全部设置", "All settings", "すべての設定"),
+            Gui::DesignText("外观与启动", "Appearance & launch", "表示と起動"),
+            Gui::DesignText("游戏与快捷键", "Games & hotkeys", "ゲームとキー設定"),
+            Gui::DesignText("更新与关于", "Updates & about", "更新と情報")
+        };
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##settings_category", categories[category])) {
+            for (int i = 0; i < 4; ++i) {
+                if (ImGui::Selectable(categories[i], category == i)) {
+                    category = i;
+                    LauncherCloseHotkeyRebindListeners();
+                }
+                if (category == i) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::Spacing();
+        auto section = [](th_glossary_t title, int group) {
+            if (category && category != group) return false;
+            return ImGui::CollapsingHeader(S(title), category ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+        };
+        if (section(THPRAC_COMPATIBILITY_SETTINGS, 2)) {
+            // mTryInnerPatch.Gui(S(THPRAC_GAMES_USE_INNER_PATCH), S(THPRAC_GAMES_USE_INNER_PATCH_DESC));
+            mFixEscLag.Gui(S(THPRAC_GAMES_FIX_ESC_LAG), S(THPRAC_GAMES_FIX_ESC_LAG_DESC));
+            mDisableJoy.Gui(S(THPRAC_DISABLE_JOY), S(THPRAC_DISABLE_JOY_DESC));
+            mCfgUnlockRefreshRate.Gui(S(THPRAC_UNLOCK_REFRESH_RATE), S(THPRAC_UNLOCK_REFRESH_RATE_DESC));
+            mCfgEnableTH16_CrashFix_autoly.Gui(S(THPRAC_INGAMEINFO_TH16_CRASH_BUGFIX), S(THPRAC_INGAMEINFO_TH16_CRASH_BUGFIX_DESC));
+            mCfgEnableTH14_MarisaFix_autoly.Gui(S(THPRAC_TH14_FORCE_FIX_BUG), S(THPRAC_TH14_FORCE_FIX_BUG_DESC));
+            ImGui::Separator();
+            mInitWindowPos.Gui(S(THPRAC_INIT_WINDOW_POS), S(THPRAC_INIT_WINDOW_POS_DESC));
+            mDisableMaximizeBtn.Gui(S(THPRAC_DISABLE_MAXIMIZE_BTN));
+            mDisableF10_11_13.Gui(S(THPRAC_DISABLE_F10_11_13), S(THPRAC_DISABLE_F10_11_13_DESC));
+            mDisableAltEnter.Gui(S(THPRAC_DISABLE_ALT_ENTER));
+            ImGui::Separator();
+            mForceRenderCursor.Gui(S(THPRAC_FORCE_RENDER_CURSOR), S(THPRAC_FORCE_RENDER_CURSOR_DESC));
+            if (mForceRenderCursor.Get()) {
+                ImGui::Text("     ");
+                ImGui::SameLine();
+                mAlwaysRenderCursor.Gui(S(THPRAC_FORCE_RENDER_CURSOR_ALWAYS), S(THPRAC_FORCE_RENDER_CURSOR_ALWAYS_DESC));
+            }
+            mForceOnlyRenderTextUsed.Gui(S(THPRAC_FORCE_ONLY_RENDER_TEXT_USED), S(THPRAC_FORCE_ONLY_RENDER_TEXT_USED_DESC));
+            mMsgBoxA2W.Gui(S(THPRAC_HOOK_MSG_BOX_A2W), S(THPRAC_HOOK_MSG_BOX_A2W_DESC));
+            mUseCorrectJaFonts.Gui(S(THPRAC_RENDER_CORRECT_FONT), S(THPRAC_RENDER_CORRECT_FONT_DESC));
+            ImGui::SameLine();
+            HelpMarker(S(THPRAC_RENDER_CORRECT_FONT_DESC2));
+            // custom fonts
+            mUseCustomFont.Gui(S(THPRAC_CUSTOM_FONTS), S(THPRAC_CUSTOM_FONTS_DESC));
+            if (mUseCustomFont.Get()) {
+                auto& fonts = EnumAllFonts();
+                mCustomFont.SetCounts(fonts.size());
+                mCustomFont.Gui(S(THPRAC_CUSTOM_FONT), GetComboStr(EnumAllFonts()).c_str());
+            }
+        }
+        ImGui::Separator();
+        if (section(THPRAC_GAME_ADJUSTMENTS, 2)) {
+            mResizableWindow.Gui(S(THPRAC_RESIZABLE_WINDOW), S(THPRAC_RESIZABLE_WINDOW_DESC));
+            mWindowSizeChangeWhenOpen.Gui(S(THPRAC_CHANGE_WINDOW_SZ_WHEN_OPEN));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(75.0f + ImGui::CalcTextSize(S(THPRAC_CHANGE_WINDOW_SZ_WHEN_OPEN_SIZE)).x);
+            mWindowSize.Gui(S(THPRAC_CHANGE_WINDOW_SZ_WHEN_OPEN_SIZE));
+
+            mUD_Replay_10.Gui(S(THPRAC_MOF_UD_REP));
+            mPauseBGM_06.Gui(S(THPRAC_PAUSE_BGM_TH678), S(THPRAC_PAUSE_BGM_TH678_DESC));
+            mAlwaysSave_07.Gui(S(THPRAC_TH07_ALWAYS_SAVE_SCORE_SPELL_HIST), S(THPRAC_TH07_ALWAYS_SAVE_SCORE_SPELL_HIST_DESC));
+            mSpeedupBGM.Gui(S(THPRAC_MAKE_BGM_FASTER_WHEN_SPEEDUP));
+            if (mSpeedupBGM.Get())
+            {
+                ImGui::Text("     ");
+                ImGui::SameLine();
+                mSpeedupBGM2.Gui(S(THPRAC_MAKE_BGM_FASTER_WHEN_SPEEDUP_NO_PITCH));
+            }
+            mCfgDisableCAtSameTime_autoly.Gui(S(TH_ADV_DISABLE_C_KEY_SAMETIME));
+            mCfgEnableLockTimer_autoly.Gui(S(THPRAC_ENABLE_LOCK_TIMER_AUTO));
+            mCfgEnableFastRetry_autoly.Gui(S(THPRAC_FAST_RETRY),S(THPRAC_FAST_RETRY_DESC));
+
+            mAutoName_06.Gui(S(THPRAC_AUTO_NAME_TH06), S(THPRAC_AUTO_NAME_TH06_DESC));
+
+            if (mAutoName_06.Get())
+            {
+                auto charfilter = [](ImGuiInputTextCallbackData* data) -> int {
+                    static std::string allowed = ".,:;~@+-/*=%(){}[]<>#!?'\"$ ";
+                    if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
+                        if ((data->EventChar >= '0' && data->EventChar <= '9') || (data->EventChar >= 'A' && data->EventChar <= 'Z') || (data->EventChar >= 'a' && data->EventChar <= 'z')) {
+                            return 0;
+                        } else {
+                            for (auto ch : allowed)
+                                if (data->EventChar == ch)
+                                    return 0;
+                            data->EventChar = 0;
+                            return 1;
+                        }
+                    }
+                    return 0;
+                };
+                ImGui::SetNextItemWidth(150.0f);
+                mName_06.Gui(S(THPRAC_AUTO_NAME_NAME), nullptr, ImGuiInputTextFlags_::ImGuiInputTextFlags_CallbackCharFilter, charfilter);
+            }
+
+            ImGui::Separator();
+            mPresentHook.Gui(S(THPRAC_PRESENT_HOOK), S(THPRAC_PRESENT_HOOK_DESC));
+            mKeyboardHook.Gui(S(THPRAC_KEYBOARD_HOOK), S(THPRAC_KEYBOARD_HOOK_DESC));
+
+            if (mPresentHook.Get() && mKeyboardHook.Get())
+                mTestInputLatency.Gui(S(THPRAC_TEST_INPUT_LATENCY));
+            if (mKeyboardHook.Get()){
+                bool enable_SOCD_v1 = false;
+                LauncherSettingGet("keyboard_SOCD", enable_SOCD_v1);
+                if (LauncherSettingRemove("keyboard_SOCD")) {
+                    int type = enable_SOCD_v1 ? 1 : 0;
+                    mKeyboardSOCD.Set(type);
+                }
+                mKeyboardSOCD.Gui(S(THPRAC_KEYBOARD_SOCD), S(THPRAC_KEYBOARD_SOCD_SETTINGS), S(THPRAC_KEYBOARD_SOCD_DESC));
+                mKeyboardAPISetting.Gui(S(THPRAC_KEYBOARD_API), S(THPRAC_KEYBOARD_API_SETTINGS), S(THPRAC_KEYBOARD_API_SETTINGS_DESC));
+                KeyBindSettings();
+
+                
+            }
+            if ((mKeyboardAPISetting.Get() == 2 || mKeyboardAPISetting.Get() == 3) && mKeyboardHook.Get())
+            {
+                // mCfgEnableAutoEsc_autoly.Gui(S(THPRAC_ESC_WHEN_DEACTIVE), S(THPRAC_ESC_WHEN_DEACTIVE_DESC));
+                mDisableWin.Gui(S(THPRAC_DISABLE_WIN_KEY_DINPUT), S(THPRAC_DISABLE_WIN_KEY_DINPUT_DESC));
+                mCfgEnableAutoShoot_autoly.Gui(S(THPRAC_AUTO_SHOOT_KEY), S(THPRAC_AUTO_SHOOT_DESC));
+                if (mCfgEnableAutoShoot_autoly.Get()) {
+                    static bool auto_shoot_key_listening = false;
+                    GuiLive2DHotkeyEdit(S(THPRAC_AUTO_SHOOT_KEY), "auto_shoot_key", false, &auto_shoot_key_listening, false);
+                }
+                if (mKeyboardAPISetting.Get() == 2) {
+                    mDinputUseGetDeviceData.Gui(S(THPRAC_KEYBOARD_API_USE_GET_DEVICE_DATA), S(THPRAC_KEYBOARD_API_USE_GET_DEVICE_DATA_DESC));
+                }
+                ImGui::NewLine();
+            }else{
+                ImGui::Separator();
+                ImGui::NewLine();
+                ImGui::Text(S(THPRAC_KEYBIND_TITLE2));
+            }
+            ImGui::Separator();
+            if (ImGui::TreeNode(S(THPRAC_SETTING_HOTKEYS))) {
+                GuiHotkeySettings();
+                ImGui::TreePop();
+            }
+        }
+        ImGui::Separator();
+        if (section(THPRAC_INGAMEINFO_ADV2, 2)) {
+            ImGui::TextWrapped(S(THPRAC_INGAMEINFO_ADV_DESC1));
+            ImGui::TextWrapped(S(THPRAC_INGAMEINFO_ADV_DESC2));
+            mCfgMapInfLifeToNoContinue_autoly.Gui(S(THPRAC_INFLIVES_MAP));
+            mCfgEnableMasterDisable_autoly.Gui(S(THPRAC_DISABLE_MASTER_AUTO));
+            mCfgTH06_RepMarker.Gui(S(THPRAC_TH06_SHOW_REP_MARKER));
+            mCfgEnableTH06_ShowRank_autoly.Gui(S(THPRAC_INGAMEINFO_TH06_SHOW_RANK2));
+            mCfgEnableTH06_BgFix_autoly.Gui(S(THPRAC_TH06_BACKGROUND_FIX), S(THPRAC_TH06_BACKGROUND_FIX_DESC));
+            mCfgEnableTH06_DisableRankDrop_autoly.Gui(S(THPRAC_TH06_RANKLOCK_DOWN));
+            mCfgEnableTH06_ShowHitbox_autoly.Gui(S(THPRAC_INGAMEINFO_TH06_SHOW_HITBOX2), S(THPRAC_INGAMEINFO_TH06_SHOW_HITBOX_DESC));
+            mCfgEnableTH06_ShowGrey_autoly.Gui(S(THPRAC_INGAMEINFO_TH06_SHOW_POINT));
+            mCfgEnableTH06_ShowThreshold_autoly.Gui(S(THPRAC_INGAMEINFO_TH06_SHOW_THRESHOLD), S(THPRAC_INGAMEINFO_TH06_SHOW_THRESHOLD_DESC));
+            mCfgEnableTH06_FixSeed_autoly.Gui(S(THPRAC_TH06_FIX_RAND_SEED));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(180.0f);
+            mCfgTH06_Seed.Gui(S(THPRAC_TH06_RAND_SEED));
+            mForceLS_08.Gui(S(THPRAC_TH08_FORCE_LS));
+            mCfgEnableTH10_ShowPoint_autoly.Gui(S(THPRAC_INGAMEINFO_TH10_SHOW_POINT));
+            mCfgEnableTH11_ShowHint_autoly.Gui(S(THPRAC_INGAMEINFO_TH11_SHOW_HINT2));
+            mCfgEnableTH12_ChromaticUFO_info.Gui(S(THPRAC_INGAMEINFO_12_UFO_SUPER_ULTRA_CHROMATIC_INFO_PRO));
+            mCfgEnableTH13_ShowHits_autoly.Gui(S(THPRAC_INGAMEINFO_TH13_SHOW_HITS2));
+            mCfgEnableTH13_ShowHitBar_autoly.Gui(S(THPRAC_INGAMEINFO_TH13_SHOW_HIT_BAR2));
+            mCfgEnableTH13_DisableMissTrance_autoly.Gui(S(THPRAC_TH13_DISABLE_TRANCE_AUTO));
+            mCfgEnableTH14_ShowBonus_autoly.Gui(S(THPRAC_INGAMEINFO_TH14_SHOW_BONUS2));
+            mCfgEnableTH14_ShowItemsCnt_autoly.Gui(S(THPRAC_INGAMEINFO_TH14_SHOW_ITEMS2));
+            mCfgEnableTH14_ShowDropBar_autoly.Gui(S(THPRAC_INGAMEINFO_TH14_SHOW_DROP_BAR2));
+            mCfgEnableTH14_LaserRepRepair_autoly.Gui(S(THPRAC_INGAMEINFO_TH14_MARISA_LASER_REP));
+            ImGui::SameLine();
+            HelpMarker(S(TH14_MODE_NORMAL_DESC));
+
+            mCfgEnableTH15_ShowShootingDownRate_autoly.Gui(S(THPRAC_INGAMEINFO_TH15_SHOW_SHOOTING_DOWN_RATE2));
+
+            mCfgEnableTH16_UncapScore_autoly.Gui(S(THPRAC_INGAMEINFO_TH16_UNCAP_SCORE));
+            mCfgEnableTH17_UncapScore_autoly.Gui(S(THPRAC_INGAMEINFO_TH17_UNCAP_SCORE));
+
+            mCfgTH18EnableCardActivatedCount.Gui(S(THPRAC_TH18_SHOW_CARD_ACTIVATED_CNT));
+
+            mCfgTH18ForceCard.Gui(S(THPRAC_TH18_FORCE_CARD), S(THPRAC_TH18_FORCE_CARD_DESC));
+            ImGui::SameLine();
+            HelpMarker(S(THPRAC_TH18_FORCE_CARD_DESC2));
+            if (mCfgTH18ForceCard.Get()){
+                if (ImGui::TreeNode(S(THPRAC_TH18_CARD))){
+                    static char card_names[32768];
+                    {// set cards
+                        static bool is_inited = false;
+                        if (!is_inited){
+                            is_inited = true;
+                            memset(card_names, 0, sizeof(card_names));
+                            char* cur_p=card_names;
+                            for (int i = 0; i < 56; i++)
+                            {
+                                int sz = strlen(S(TH18::TH18_CARD_LIST[i]));
+                                memcpy(cur_p,S(TH18::TH18_CARD_LIST[i]), sz);
+                                cur_p += sz+1;
+                            }
+                        }
+                    }
+                    mCfgTH18Card_st1.Gui(S(THPRAC_TH18_CARD_1), card_names);
+                    mCfgTH18Card_st2.Gui(S(THPRAC_TH18_CARD_2), card_names);
+                    mCfgTH18Card_st3.Gui(S(THPRAC_TH18_CARD_3), card_names);
+                    mCfgTH18Card_st4.Gui(S(THPRAC_TH18_CARD_4), card_names);
+                    mCfgTH18Card_st5.Gui(S(THPRAC_TH18_CARD_5), card_names);
+                    mCfgTH18Card_st7.Gui(S(THPRAC_TH18_CARD_7), card_names);
+                    ImGui::TreePop();
+                }
+            }
+            mCfgEnableTH20_PIV_OverflowFix_autoly.Gui(S(THPRAC_TH20_PIV_OVERFLOW_FIX));
+            mCfgEnableTH20_PIV_Uncap_autoly.Gui(S(THPRAC_TH20_UNCAP_PIV));
+            mCfgEnableTH20_Score_Uncap_autoly.Gui(S(THPRAC_TH20_UNCAP_SCORE));
+            mCfgEnableTH20_FakeUnlockStones_autoly.Gui(S(THPRAC_TH20_FAKE_UNLOCK_STONES), S(THPRAC_TH20_UNLOCK_STONES_DESC));
+            mCfgEnableTH20_FixBulletHitbox_autoly.Gui(S(THPRAC_TH20_FIX_BULLETHITBOX), S(THPRAC_TH20_FIX_BULLETHITBOX_DESC));
+            mCfgEnableTH20_DecreaseGrazeEffect_autoly.Gui(S(THPRAC_TH20_DECREASE_EFF));
+            mCfgEnableTH20_LvLock_autoly.Gui(S(THPRAC_TH20_LV_LOCK));
+            ImGui::Separator();
+            ImGui::Text(S(THPRAC_KB));
+            
+            if (ImGui::TreeNode(S(THPRAC_KB_SHOW))) {
+                KeyRectStyle style;
+                style.separated = mKb_Separated.Get();
+                style.border_color_press = mKb_ColorBorderPress.Get();
+                style.border_color_release = mKb_ColorBorderRelease.Get();
+                style.fill_color_press = mKb_ColorFillPress.Get();
+                style.fill_color_release = mKb_ColorFillRelease.Get();
+                style.text_color_press = mKb_ColorTextPress.Get();
+                style.text_color_release = mKb_ColorTextRelease.Get();
+                style.type = mKb_Type.Get();
+                style.show_aps = mKb_APS.Get();
+                float kb_padding = mKb_Padding.Get();
+                style.padding = { kb_padding, kb_padding };
+
+                ImGuiIO& io = ImGui::GetIO();
+                style.size = { 34.0f / io.DisplaySize.x * 1280.0f, 34.0f / io.DisplaySize.y * 960.0f };
+
+                auto pos = ImGui::GetCursorScreenPos();
+                auto width = ImGui::GetWindowSize().x * 0.5f;
+                ImGui::InvisibleButton("##keys", { 34.0f, 34.0f * 2.5f });
+                RecordKey(15, 69);
+                KeysHUD(15, { width / io.DisplaySize.x * 1280.0f, pos.y / io.DisplaySize.y * 960.0f }, { pos.x / io.DisplaySize.x * 1280.0f, pos.y / io.DisplaySize.y * 960.0f }, style, true, false);
+                ImGui::TreePop();
+            }
+            mKb_Auto.Gui(S(THPRAC_KB_AUTO));
+            mKb_ColorBorderPress.Gui(S(THPRAC_KB_COL_BORDER_PRESSED));
+            mKb_ColorBorderRelease.Gui(S(THPRAC_KB_COL_BORDER_RELEASED));
+            mKb_ColorFillPress.Gui(S(THPRAC_KB_COL_FILL_PRESSED));
+            mKb_ColorFillRelease.Gui(S(THPRAC_KB_COL_FILL_RELEASED));
+            mKb_ColorTextPress.Gui(S(THPRAC_KB_COL_TEXT_PRESSED));
+            mKb_ColorTextRelease.Gui(S(THPRAC_KB_COL_TEXT_RELEASED));
+            mKb_Separated.Gui(S(THPRAC_KB_SEPARATER));
+            mKb_APS.Gui(S(THPRAC_KB_APS));
+            mKb_Padding.Gui(S(THPRAC_KB_PADDING));
+            mKb_Type.Gui(S(THPRAC_KB_TYPE),S(THPRAC_KB_TYPE_COMBO));
+        }
+        ImGui::Separator();
+        if (section(THPRAC_LAUNCH_BEHAVIOR, 1)) {
+            mAdminRights.Gui(S(THPRAC_ADMIN_RIGHTS));
+            mExistingGameAction.Gui(S(THPRAC_EXISTING_GAME_ACTION), S(THPRAC_EXISTING_GAME_ACTION_OPTION));
+            mDontSearchOngoingGame.Gui(S(THPRAC_DONT_SEARCH_ONGOING));
+            mReflectiveLaunch.Gui(S(THPRAC_REFLECTIVE_LAUNCH), S(THPRAC_REFLECTIVE_LAUNCH_DESC));
+        }
+        ImGui::Separator();
+        if (section(THPRAC_SETTING_LAUNCHER, 1)) {
+            // Window size and UI scale are baked in when the launcher window is
+            // created, so both only take effect after a restart.
+            mCfgLauncherWindowSize.Gui(S(THPRAC_LAUNCHER_WINDOW_SIZE), S(THPRAC_LAUNCHER_WINDOW_SIZE_OPTION), S(THPRAC_LAUNCHER_WINDOW_SIZE_DESC));
+            if (mCfgLauncherWindowSize.Get() >= LauncherWindowSizePresetCount()) {
+                // Width is clamped to 640..1280 and height to 480..960, the same
+                // range the window creation enforces.
+                auto& size = mCfgLauncherWindowSizeCustom.Get();
+                int custom[2] = { size[0], size[1] };
+                ImGui::SetNextItemWidth(200.0f);
+                if (ImGui::DragInt2("##launcher_window_size", custom, 1.0f, 480, 1280)) {
+                    std::array<int, 2> value { std::clamp(custom[0], 640, 1280), std::clamp(custom[1], 480, 960) };
+                    mCfgLauncherWindowSizeCustom.Set(value);
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(S(THPRAC_LAUNCHER_WINDOW_SIZE_CUSTOM));
+            }
+
+            ImGui::TextUnformatted(S(THPRAC_LAUNCHER_UI_SCALE));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.0f);
+            static bool uiScaleDirty = false;
+            // The value is printed next to the slider: this ImGui draws the grab
+            // over the in-slider text, which hides the digits at mid positions.
+            if (ImGui::SliderInt("##launcher_ui_scale", &mCfgLauncherUiScale.Get(), 75, 150, "")) {
+                uiScaleDirty = true;
+            }
+            if (uiScaleDirty && !ImGui::IsItemActive()) {
+                mCfgLauncherUiScale.Set();
+                uiScaleDirty = false;
+            }
+            ImGui::SameLine();
+            ImGui::Text("%d%%", mCfgLauncherUiScale.Get());
+            ImGui::SameLine();
+            HelpMarker(S(THPRAC_LAUNCHER_UI_SCALE_DESC));
+            if (LauncherWndDisplaySettingsPending()) {
+                ImGui::TextUnformatted(S(THPRAC_LAUNCHER_RESTART_TO_APPLY));
+            }
+            ImGui::Separator();
+
+            mRecordGameTime.Gui(S(THPRAC_RECORD_GAME_TIME));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50.0f + ImGui::CalcTextSize(S(THPRAC_GAME_TIME_HINT)).x);
+            mGameTimeTooLongTime.Gui(S(THPRAC_GAME_TIME_HINT));
+
+            ImGui::Separator();
+            mBackupThpFile.Gui(S(THPRAC_BACKUP_THP_FILE));
+            mBackupAutoly.Gui(S(THPRAC_AUTO_BACKUP_THP_FILE), S(THPRAC_BACKUP_DESC));
+            ImGui::Separator();
+
+            int theme_prev = mCfgTheme.Get();
+            if (mCfgTheme.Gui(S(THPRAC_THEME), S(THPRAC_THEME_OPTION))) {
+                int Sus = 0;
+                if (mCfgTheme.Get() > 2) {
+                    UpdateThemesList();
+                    themeIsUser = (unsigned int)theme_prev > 2;
+                    if (userThemes.size() == 0) {
+                        mCfgTheme.Set(themeIsUser ? Sus : theme_prev);
+                    } else if (!themeIsUser) {
+                        LauncherSettingSet("theme_user", userThemes[0].utf8);
+                        SetTheme(mCfgTheme.Get(), userThemes[userThemeIdx].utf16);
+                        themeIsUser = true;
+                    }
+                } else {
+                    SetTheme(mCfgTheme.Get());
+                    themeIsUser = false;
+                }
+            }
+            if (themeIsUser && userThemes.size() != 0 && ImGui ::BeginCombo("##themes_user", userThemes[userThemeIdx].utf8)) {
+                for (size_t i = 0; i < userThemes.size(); i++) {
+                    bool selected = i == userThemeIdx;
+                    if (ImGui::Selectable(userThemes[i].utf8, selected)) {
+                        userThemeIdx = i;
+                        SetTheme(mCfgTheme.Get(), userThemes[userThemeIdx].utf16);
+                        LauncherSettingSet("theme_user", userThemes[userThemeIdx].utf8);
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            mCfgAfterLaunch.Gui(S(THPRAC_AFTER_LAUNCH), S(THPRAC_AFTER_LAUNCH_OPTION));
+            mAutoDefLaunch.Gui(S(THPRAC_AUTO_DEFAULT_LAUNCH), S(THPRAC_AUTO_DEFAULT_LAUNCH_DESC));
+            mCfgThpracDefault.Gui(S(THPRAC_APPLY_THPRAC_DEFAULT), S(THPRAC_APPLY_THPRAC_DEFAULT_OPTION));
+            mCfgFilterDefault.Gui(S(THPRAC_FILTER_DEFAULT), S(THPRAC_FILTER_DEFAULT_OPTION), S(THPRAC_FILTER_DEFAULT_DESC));
+            PathAndDirSettings();
+        }
+        ImGui::Separator();
+        if (section(THPRAC_THCRAP, 1)) {
+            GuiThcrapSettings();
+        }
+        ImGui::Separator();
+        if (section(THPRAC_SETTING_LANGUAGE, 1)) {
+            mCfgLanguage.Gui(S(THPRAC_LANGUAGE), (const char*)u8"中文\0English\0日本語\0\0");
+            if (mOriginalLanguage != mCfgLanguage.Get()) {
+                ImGui::TextUnformatted(th_glossary_str[mCfgLanguage.Get()][THPRAC_LANGUAGE_HINT]);
+            }
+            mDisableLocaleChangeHotkey.Gui(S(THPRAC_DISABLE_LOCALE_CHANGE_HOTKEY), S(THPRAC_DISABLE_LOCALE_CHANGE_HOTKEY_DESC));
+        }
+        ImGui::Separator();
+        if (section(THPRAC_SETTING_ABOUT, 3)) {
+            ImGui::Text(S(TH_ABOUT_VERSION), GetVersionStr());
+            ImGui::SameLine();
+            if (ImGui::Button(S(TH_ABOUT_SHOW_LICENCE))) {
+                mGuiUpdFunc = [&]() { GuiLicenceWnd(); };
+            }
+            ImGui::NewLine();
+            ImGui::TextUnformatted(S(TH_ABOUT_AUTHOR));
+            ImGui::TextUnformatted(S(TH_ABOUT_BRANCH));
+            TextLink(S(TH_ABOUT_WEBSITE), L"https://github.com/RUEEE/thprac");
+            ImGui::NewLine();
+            ImGui::Text(S(TH_ABOUT_THANKS), "You!");
+        }
+    }
+
+    THCfgCombo mCfgLanguage { "language", 0, 3 };
+    THCfgCheckbox mCfgAlwaysOpen { "always_open_launcher", false };
+    THCfgCombo mCfgAfterLaunch { "after_launch", 0, 3 };
+    THCfgCheckbox mAutoDefLaunch { "auto_default_launch", false };
+    THCfgCombo mCfgThpracDefault { "apply_thprac_default", 0, 3 };
+    THCfgCombo mCfgFilterDefault { "filter_default", 0, 3 };
+    THCfgCombo mCfgTheme { "theme", 1, 4 };
+    // Startup window size: index into the presets in thprac_launcher_wnd.cpp;
+    // the index equal to LauncherWindowSizePresetCount() means "custom".
+    THCfgCombo mCfgLauncherWindowSize { "launcher_window_size_type", 5, LauncherWindowSizePresetCount() + 1 };
+    THCfgInt2 mCfgLauncherWindowSizeCustom { "launcher_window_size", { 1280, 960 }, 480, 1280 };
+    THCfgInt mCfgLauncherUiScale { "launcher_ui_scale", 100, 75, 150 };
+    THSetting<bool> mUseRelativePath { "use_relative_path", false };
+    THSetting<std::string> mThcrap { "thcrap", "" };
+    THCfgCheckbox mCfgUnlockRefreshRate { "unlock_refresh_rate", false };
+    THCfgCheckbox mCfgCheckUpdate { "check_update", false };
+
+    // advanced igi
+    THCfgCheckbox mCfgMapInfLifeToNoContinue_autoly { "auto_map_inf_life_to_no_continue", true };
+    THCfgCheckbox mCfgEnableTH06_DisableRankDrop_autoly { "auto_th06_disable_rank_drop", false };
+    THCfgCheckbox mCfgEnableTH06_ShowRank_autoly { "auto_th06_show_rank", false };
+    THCfgCheckbox mCfgEnableTH06_BgFix_autoly { "auto_th06_bg_fix", false };
+    THCfgCheckbox mCfgEnableTH06_FixSeed_autoly { "auto_th06_fix_seed", false };
+    THCfgCheckbox mCfgEnableTH06_ShowGrey_autoly { "auto_th06_show_grey", false };
+    THCfgCheckbox mCfgEnableTH06_ShowThreshold_autoly { "auto_th06_show_threshold", false };
+    THCfgInt      mCfgTH06_Seed { "th06_seed", 0, 0, 65535 };
+    THCfgCheckbox mCfgTH06_RepMarker { "auto_th06_rep_marker",true };
+    THCfgCheckbox mCfgEnableTH06_ShowHitbox_autoly { "auto_th06_show_hitbox", false };
+    THCfgCheckbox mCfgEnableTH10_ShowPoint_autoly { "auto_th10_show_point", false };
+    THCfgCheckbox mCfgEnableTH11_ShowHint_autoly { "auto_th11_show_hint", false };
+    THCfgCheckbox mCfgEnableTH12_ChromaticUFO_info { "chromatic_UFO_info", false };
+    THCfgCheckbox mCfgEnableTH13_ShowHits_autoly { "auto_th13_show_hits", false };
+    THCfgCheckbox mCfgEnableTH13_ShowHitBar_autoly { "auto_th13_show_hitbar", false };
+    THCfgCheckbox mCfgEnableTH13_DisableMissTrance_autoly { "auto_th13_disable_miss_trance", false };
+    THCfgCheckbox mCfgEnableTH14_ShowBonus_autoly { "auto_th14_show_bonus", false };
+    THCfgCheckbox mCfgEnableTH14_ShowItemsCnt_autoly { "auto_th14_show_item_cnt", false };
+    THCfgCheckbox mCfgEnableTH14_ShowDropBar_autoly { "auto_th14_show_drop_bar", false };
+    THCfgCheckbox mCfgEnableTH14_LaserRepRepair_autoly { "auto_th14_laser_rep_repair", false };
+    THCfgCheckbox mCfgEnableTH15_ShowShootingDownRate_autoly { "auto_th15_show_rate", false };
+    THCfgCheckbox mCfgEnableTH16_UncapScore_autoly { "auto_th16_uncap_score", false };
+    THCfgCheckbox mCfgEnableTH17_UncapScore_autoly { "auto_th17_uncap_score", false };
+    THCfgCheckbox mCfgEnableMasterDisable_autoly { "auto_disable_master", false };
+
+    THCfgCheckbox mCfgEnableLockTimer_autoly { "auto_lock_timer", false };
+    THCfgCheckbox mCfgDisableCAtSameTime_autoly { "auto_disable_C", true };
+    THCfgCheckbox mCfgEnableFastRetry_autoly { "auto_fast_retry", false };
+    THCfgCheckbox mCfgEnableAutoShoot_autoly { "auto_auto_shoot", false };
+    // THCfgCheckbox mCfgEnableAutoEsc_autoly { "auto_esc_when_loss_focus", false };
+
+    THCfgCheckbox mCfgTH18ForceCard { "th18_force_card", false };
+    THCfgCheckbox mCfgTH18EnableCardActivatedCount { "th18_card_activated_count", false };
+    THCfgCombo mCfgTH18Card_st1 { "th18_card_st1", 0,56 };
+    THCfgCombo mCfgTH18Card_st2 { "th18_card_st2", 0,56 };
+    THCfgCombo mCfgTH18Card_st3 { "th18_card_st3", 0,56 };
+    THCfgCombo mCfgTH18Card_st4 { "th18_card_st4", 0,56 };
+    THCfgCombo mCfgTH18Card_st5 { "th18_card_st5", 0,56 };
+    THCfgCombo mCfgTH18Card_st7 { "th18_card_st7", 0,56 };
+
+    THCfgCheckbox mCfgEnableTH20_PIV_OverflowFix_autoly { "auto_th20_PIV_overflow_fix", true };
+    THCfgCheckbox mCfgEnableTH20_PIV_Uncap_autoly { "auto_th20_PIV_uncap", true };
+    THCfgCheckbox mCfgEnableTH20_Score_Uncap_autoly { "auto_th20_score_uncap",true};
+    THCfgCheckbox mCfgEnableTH20_FakeUnlockStones_autoly { "auto_th20_fake_unlock_stones",true};
+    THCfgCheckbox mCfgEnableTH20_FixBulletHitbox_autoly { "auto_th20_fix_bullet_hitbox",true};
+    THCfgCheckbox mCfgEnableTH20_DecreaseGrazeEffect_autoly { "auto_th20_decrease_graze_effect",false};
+    THCfgCheckbox mCfgEnableTH20_LvLock_autoly { "auto_th20_lv_lock",false};
+    // kbs
+    THCfgColor mKb_ColorBorderPress { "kb_border_color_press", 0xFFFFFFFF };
+    THCfgColor mKb_ColorBorderRelease { "kb_border_color_release", 0xFFFFFFFF };
+    THCfgColor mKb_ColorFillPress { "kb_fill_color_press", 0xFFFF4444 };
+    THCfgColor mKb_ColorFillRelease { "kb_fill_color_release", 0xFFFFCCCC };
+    THCfgColor mKb_ColorTextPress { "kb_text_color_press", 0xFFFFFFFF };
+    THCfgColor mKb_ColorTextRelease { "kb_text_color_release", 0xFFFFFFFF };
+    THCfgCheckbox mKb_Separated { "kb_separated", true };
+    THCfgCheckbox mKb_APS { "kb_aps", true };
+    THCfgCheckbox mKb_Auto { "auto_keyboard_monitor", false };
+    THCfgCombo mKb_Type { "kb_type",0,4 };
+    THCfgFloat mKb_Padding  { "kb_padding",0.05f,0.0f,0.1f};
+
+    THCfgCheckbox mResizableWindow { "resizable_window", false };
+    THCfgCheckbox mTryInnerPatch { "tryInnerPatch", false };
+    THCfgCheckbox mFixEscLag { "fixEscLag", false };
+    THCfgCheckbox mDisableMaximizeBtn { "disableMax_btn", false };
+    THCfgCheckbox mInitWindowPos { "init_window_pos", true };
+    THCfgCheckbox mDisableLocaleChangeHotkey { "disable_locale_change_hotkey", true };
+    THCfgCheckbox mCfgEnableTH16_CrashFix_autoly { "auto_th16_crash_fix", false };
+    THCfgCheckbox mCfgEnableTH14_MarisaFix_autoly { "auto_th14_fix_marisa_bug_using_0", false };
+
+    THCfgCheckbox mWindowSizeChangeWhenOpen { "change_window_size_when_open", false };
+    THCfgInt2 mWindowSize { "changed_window_size", {1920,1440},1,8192 };
+
+    THCfgCheckbox mTestInputLatency { "test_input_latency", false};
+
+    THCfgCheckbox mPresentHook { "enable_present_hook", false };
+    THCfgCheckbox mKeyboardHook { "enable_keyboard_hook", true };
+    THCfgCombo mKeyboardSOCD { "keyboard_SOCDv2", 0, 3 };
+    THCfgCombo mKeyboardAPISetting { "keyboard_API", 0, 4 };
+    THCfgCheckbox mDinputUseGetDeviceData { "use_get_device_data", false };
+
+    THCfgCheckbox mDisableF10_11_13 { "disable_F10_11_13", false };
+    THCfgCheckbox mDisableAltEnter { "disable_alt_enter", false };
+    THCfgCheckbox mUD_Replay_10 { "th10_ud_Replay", true };
+    // THCfgCheckbox mDisableWinKey { "disable_win_key", false };
+    THCfgCheckbox mSpeedupBGM { "fast_BGM_when_spdup", false };
+    THCfgCheckbox mSpeedupBGM2 { "fast_BGM_when_spdup_no_pitch", false };
+    THCfgCheckbox mPauseBGM_06 { "pauseBGM_06", true };
+    THCfgCheckbox mAutoName_06 { "autoInputName_06", false };
+    THCfgCheckbox mAlwaysSave_07 { "always_save_score_hist_07", false };
+    THCfgCheckbox mForceLS_08 { "forceLS_08", false };
+    THCfgText mName_06 { "autoName_06", "", 9};
+    
+    THCfgCheckbox mRecordGameTime { "recordGameTime", false };
+    THCfgFloat mGameTimeTooLongTime { "gameTimeTooLong_Time", 3.0f, 0.001f,1000.0f };
+    THCfgCheckbox mGameTimeTooLongSE { "gameTimeTooLong_SE", false };
+    THCfgFloat mGameTimeTooLongSERepeat { "gameTimeTooLong_SE_repeat", 5.0f, 5.0f,100000.0f };
+
+    THCfgCheckbox mBackupThpFile { "backup_thp_file", false };
+    THCfgCheckbox mBackupAutoly { "auto_backup_score_file", false };
+
+    THCfgCheckbox mReflectiveLaunch { "reflective_launch", false };
+    THCfgCheckbox mForceOnlyRenderTextUsed { "force_only_render_text_used", true };
+    THCfgCheckbox mDisableJoy { "disableJoy", false };
+    THCfgCheckbox mDisableWin { "disableWinDinput8", false };
+    THCfgCheckbox mForceRenderCursor { "force_render_cursor", false };
+    THCfgCheckbox mAlwaysRenderCursor { "always_render_cursor", false };
+    THCfgCheckbox mMsgBoxA2W { "msg_box_a2w", true};
+    THCfgCheckbox mUseCorrectJaFonts { "use_correct_ja_fonts", false };
+    THCfgCheckbox mUseCustomFont { "use_custom_font", false };
+    THCfgCombo mCustomFont { "custom_font", 0, 999 };
+
+    THCfgCombo mExistingGameAction { "existing_game_launch_action", 0, 3 };
+    THCfgCheckbox mDontSearchOngoingGame { "dont_search_ongoing_game", false };
+    THCfgCheckbox mAdminRights { "thprac_admin_rights", false };
+    int mOriginalLanguage;
+
+    THCfgCombo mHotkeyBackspaceMenu { "backspace_menu_chord", 1 << Gui::ChordKey_Backspace, 1 << Gui::ChordKey_COUNT };
+    THCfgCombo mHotkeyF12Menu { "advanced_menu_chord", 1 << Gui::ChordKey_F12, 1 << Gui::ChordKey_COUNT };
+    THCfgCombo mHotkeyScreenshot { "screenshot_chord", 1 << Gui::ChordKey_Home, 1 << Gui::ChordKey_COUNT };
+    THCfgCombo mHotkeyLanguage { "language_chord", 1 << Gui::ChordKey_Alt, 1 << Gui::ChordKey_COUNT };
+
+    bool mHotkeyBackspaceMenuListening = false;
+    bool mHotkeyF12MenuListening = false;
+    bool mHotkeyScreenshotListening = false;
+    bool mHotkeyLanguageListening = false;
+
+
+
+    std::string mThcrapHintStr;
+    float mThcrapHintTime = 0.0f;
+    int mThcrapHintTimeBuffer = false;
+    std::string mThcrapAddPrompt;
+    float mThcrapAddPromptTime = 0.0f;
+    ImVec4 mThcrapAddPromptCol;
+    std::vector<GameRoll> mThcrapGames[4];
+    bool mGameTypeOpt[4];
+    std::vector<std::pair<std::string, bool>> mThcrapCfg;
+
+    unsigned int mCfgResetFlag = 0;
+    int mCfgUseLocalDir = 0;
+    int mCfgDirChgGlobalParam = 0;
+    int mCfgDirChgLocalParam = 0;
+    bool mCfgRelativePath = false;
+
+    std::function<void(void)> mGuiUpdFunc = []() {};
+
+public:
+    void CloseHotkeyRebindListeners()
+    {
+        mHotkeyBackspaceMenuListening = false;
+        mHotkeyF12MenuListening = false;
+        mHotkeyScreenshotListening = false;
+        mHotkeyLanguageListening = false;
+    }
+};
+
+int64_t LauncherGetGameTime()
+{
+    std::string gametime;
+    if (LauncherSettingGet("Gametime", gametime)){
+        int64_t gametime_ns = 0;
+        if (sscanf_s(gametime.c_str(), "%lld", &gametime_ns)) {
+            return gametime_ns;
+        }
+    }
+    return -1;
+}
+
+void LauncherSetGameTime(int64_t gametime_ns)
+{
+    std::string gametime = std::format("{}",gametime_ns);
+    LauncherSettingSet("Gametime", gametime);
+    return;
+}
+
+void LauncherCfgReset()
+{
+    THCfgGui::singleton().LauncherCfgReset();
+}
+void LauncherCfgGuiUpd()
+{
+    THCfgGui::singleton().GuiUpdate();
+}
+void LauncherCloseHotkeyRebindListeners()
+{
+    THCfgGui::singleton().CloseHotkeyRebindListeners();
+}
+
+
+}

@@ -1,0 +1,26 @@
+set(THPRAC_ADAPTER_SOURCES
+    thprac/src/thprac/thprac_alcostg.cpp
+    thprac/src/thprac/thprac_th06.cpp
+    thprac/src/thprac/thprac_th07.cpp
+    thprac/src/thprac/thprac_th08.cpp
+    thprac/src/thprac/thprac_th09.cpp
+    thprac/src/thprac/thprac_th095.cpp
+    thprac/src/thprac/thprac_th10.cpp
+    thprac/src/thprac/thprac_th11.cpp
+    thprac/src/thprac/thprac_th12.cpp
+    thprac/src/thprac/thprac_th125.cpp
+    thprac/src/thprac/thprac_th128.cpp
+    thprac/src/thprac/thprac_th13.cpp
+    thprac/src/thprac/thprac_th14.cpp
+    thprac/src/thprac/thprac_th143.cpp
+    thprac/src/thprac/thprac_th15_c7.cpp
+    thprac/src/thprac/thprac_th16.cpp
+    thprac/src/thprac/thprac_th165.cpp
+    thprac/src/thprac/thprac_th17.cpp
+    thprac/src/thprac/thprac_th18.cpp
+    thprac/src/thprac/thprac_th185.cpp
+    thprac/src/thprac/thprac_th19.cpp
+    thprac/src/thprac/thprac_th19.v1.00a.cpp
+    thprac/src/thprac/thprac_th19.v1.00c.cpp
+    thprac/src/thprac/thprac_th20.cpp
+)

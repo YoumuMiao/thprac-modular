@@ -1,0 +1,5 @@
+{
+  "zh": "统计符卡和非符的尝试、收取与超时次数，并保存跨次运行的记录。",
+  "en": "Tracks spell and nonspell attempts, captures, and timeouts across sessions.",
+  "ja": "スペルカードと通常攻撃の挑戦、取得、時間切れをセッションをまたいで記録します。"
+}

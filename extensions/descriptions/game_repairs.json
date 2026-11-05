@@ -1,0 +1,5 @@
+{
+  "zh": "修补 TH06–TH08 的 DX8 绘制和重绘，让 TH07/TH08 的练习菜单、设置页和其他浮层随 OILP 补帧绘制，并修正 TH14 旧弹收率归因。",
+  "en": "Fixes DX8 drawing and redraws in TH06–TH08, composites practice menus and other overlays on OILP interpolated frames in TH07/TH08, and fixes TH14 capture attribution for leftover bullets.",
+  "ja": "TH06～TH08 の DX8 描画と再描画、TH07/TH08 の OILP 補間時の練習画面とオーバーレイ、TH14 の残留弾の取得率判定を修正します。"
+}

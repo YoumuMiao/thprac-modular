@@ -1,0 +1,5 @@
+{
+  "zh": "跨作品游戏内插件共用的适配层，提供游戏识别、Hook 和绘制接线。使用这些插件时请保留。",
+  "en": "Shared game adapter for cross-title plugins, providing game detection, hooks, and rendering. Keep enabled when using them.",
+  "ja": "作品共通プラグイン向けにゲーム識別、フック、描画を提供します。利用時は有効にしてください。"
+}

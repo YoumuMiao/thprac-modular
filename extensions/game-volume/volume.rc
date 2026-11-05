@@ -1,0 +1,17 @@
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+IDD_VOLUME DIALOGEX 0, 0, 202, 79
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "thprac - Global game volume"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "BGM", -1, 8, 13, 40, 10
+    CONTROL "", IDC_BGM, "msctls_trackbar32", WS_TABSTOP | TBS_AUTOTICKS, 50, 8, 115, 19
+    RTEXT "100", IDC_BGM_VALUE, 170, 13, 21, 10
+    LTEXT "Sound effects", -1, 8, 36, 44, 10
+    CONTROL "", IDC_SE, "msctls_trackbar32", WS_TABSTOP | TBS_AUTOTICKS, 50, 31, 115, 19
+    RTEXT "100", IDC_SE_VALUE, 170, 36, 21, 10
+    DEFPUSHBUTTON "Apply", IDOK, 87, 59, 52, 14
+    PUSHBUTTON "Cancel", IDCANCEL, 145, 59, 49, 14
+END
