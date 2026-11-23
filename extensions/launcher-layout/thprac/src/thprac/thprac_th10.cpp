@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_games_hooks.h"
@@ -142,14 +143,20 @@ namespace TH10 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mChapter, mLife, mGraze, mPower,
+            mScore, mFaith, mFaithBar, mSt6Boss9Spd, mRealBulletSprite)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             static int diff_prev = -1;
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x474c74);
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x474c74);
                 SetFade(0.8f, 0.1f);
                 Open();
                 thPracParam.Reset();
@@ -182,6 +189,8 @@ namespace TH10 {
                 SetFade(0.8f, 0.1f);
                 Close();
                 *mNavFocus = 0;
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -401,6 +410,8 @@ namespace TH10 {
 
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -3278,9 +3289,6 @@ namespace TH10 {
         if (static_cast<int32_t>(pCtx->Eax) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th10_capture_observe, 0x412a00, 6, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Eax+0x14d8));
-    })
     EHOOK_ADDON_DY(th10_capture_config_short, 0x412720, 2, (1u << static_cast<unsigned>(Addon::Capture)), {
         BossCaptureConfiguredCurrent(pCtx->Esi);
     })
@@ -3344,6 +3352,7 @@ namespace TH10 {
             hook.Setup();
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(10);
 
         if (g_adv_igi_options.th10_ud_Replay)
             EnableAllHooks(TH10_UD_REP);

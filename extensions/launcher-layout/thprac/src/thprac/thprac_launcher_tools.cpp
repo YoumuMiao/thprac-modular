@@ -24,6 +24,8 @@
 
 namespace THPrac {
 
+bool DrawBgmLauncherPanel();
+void OpenBgmLauncherPanel();
 extern LPDIRECT3DDEVICE9 g_pd3dDevice;
 void LauncherToolsGuiSwitch(const char* gameStr);
 
@@ -2323,6 +2325,7 @@ private:
             { S(THPRAC_TOOLS_ROLLF_FROM_FILE) },
             { S(THPRAC_TOOLS_REACTION_TEST) },
             { S(THPRAC_TOOLS_DICE) },
+            { Gui::DesignText("背景音乐", "Background Music", "BGM") },
         };
         switch (Gui::LauncherActionGrid(actions, static_cast<int>(elementsof(actions)))) {
         case 0: FindOngoingGame(true); break;
@@ -2333,6 +2336,10 @@ private:
         case 5: mGuiUpdFunc = [&]() { return mGuiRollAll.GuiUpdate(); }; break;
         case 6: mGuiUpdFunc = [&]() { return mGuiReactionTest.GuiUpdate(); }; break;
         case 7: mGuiUpdFunc = [&]() { return mGuiDice.GuiUpdate(); }; break;
+        case 8:
+            OpenBgmLauncherPanel();
+            mGuiUpdFunc = DrawBgmLauncherPanel;
+            break;
         }
         DrawExtensionTools();
         return true;

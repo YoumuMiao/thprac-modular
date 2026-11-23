@@ -1,9 +1,11 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
 #include <array>
 #include <list>
 #include <format>
+#include <optional>
 #include <d3d9.h>
 
 
@@ -21,7 +23,115 @@ namespace TH14 {
     };
     int g_lock_timer = 0;
     bool g_lock_timer_flag = false;
-    
+
+    static int KagerouNonspellIndex(int section)
+    {
+        if (section == TH14_ST3_BOSS3)
+            return 0;
+        if (section == TH14_ST3_BOSS5)
+            return 1;
+        return -1;
+    }
+
+    static constexpr float kKagerouRadiansPerDegree = 0.017453292519943295f;
+    static constexpr uint32_t kKagerouGroupSize = 3;
+    using KagerouAngleGroup = std::array<float, kKagerouGroupSize>;
+
+    static std::optional<float> ReadKagerouRadian(const rapidjson::Value& value)
+    {
+        constexpr float pi = 3.14159265358979323846f;
+        if (!value.IsNumber() || value.GetDouble() < -pi || value.GetDouble() > pi)
+            return std::nullopt;
+        return value.GetFloat();
+    }
+
+    static std::optional<KagerouAngleGroup> ReadKagerouAngleGroup(const rapidjson::Value& values)
+    {
+        if (!values.IsArray() || values.Size() != kKagerouGroupSize)
+            return std::nullopt;
+        KagerouAngleGroup group;
+        for (uint32_t i = 0; i < kKagerouGroupSize; ++i) {
+            const auto angle = ReadKagerouRadian(values[i]);
+            if (!angle)
+                return std::nullopt;
+            group[i] = *angle;
+        }
+        return group;
+    }
+
+    static rapidjson::Value WriteKagerouAngleGroup(const float* radians, rapidjson::Document::AllocatorType& allocator)
+    {
+        rapidjson::Value values(rapidjson::kArrayType);
+        for (uint32_t i = 0; i < kKagerouGroupSize; ++i)
+            values.PushBack(radians[i], allocator);
+        return values;
+    }
+
+    struct KagerouAngleSequence {
+        static constexpr uint32_t capacity = 36 * kKagerouGroupSize;
+        uint32_t count;
+        float radians[capacity];
+
+        bool Read(const rapidjson::Value& values)
+        {
+            if (!values.IsArray() || values.Empty() || values.Size() > capacity)
+                return false;
+            KagerouAngleSequence sequence {};
+            for (const auto& value : values.GetArray()) {
+                const auto angle = ReadKagerouRadian(value);
+                if (!angle)
+                    return false;
+                sequence.radians[sequence.count++] = *angle;
+            }
+            *this = sequence;
+            return true;
+        }
+
+        rapidjson::Value Write(rapidjson::Document::AllocatorType& allocator) const
+        {
+            rapidjson::Value values(rapidjson::kArrayType);
+            for (uint32_t i = 0; i < std::min(count, capacity); ++i)
+                values.PushBack(radians[i], allocator);
+            return values;
+        }
+    };
+
+    static std::array<KagerouAngleSequence, 2> kagerouRecords {};
+    static std::array<bool, 2> kagerouRecordingStarted {};
+    static bool kagerouRecording;
+    static void UpdateKagerouAngleHook();
+
+    static std::optional<KagerouAngleGroup> PasteKagerouAngleGroup(int index)
+    {
+        const char* text = ImGui::GetClipboardText();
+        if (!text || strnlen_s(text, 4097) > 4096)
+            return std::nullopt;
+        rapidjson::Document code;
+        code.Parse(text);
+        if (code.HasParseError() || !code.IsObject() || !code.HasMember("th14_st3_nonspell")
+            || !code["th14_st3_nonspell"].IsInt() || code["th14_st3_nonspell"].GetInt() != index + 2
+            || !code.HasMember("angles_rad"))
+            return std::nullopt;
+        return ReadKagerouAngleGroup(code["angles_rad"]);
+    }
+
+    static void CopyKagerouAngleGroup(int index, int group)
+    {
+        rapidjson::Document code;
+        code.SetObject();
+        auto& allocator = code.GetAllocator();
+        code.AddMember("th14_st3_nonspell", index + 2, allocator);
+        const auto* radians = kagerouRecords[index].radians + (group - 1) * kKagerouGroupSize;
+        code.AddMember("angles_rad", WriteKagerouAngleGroup(radians, allocator), allocator);
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        code.Accept(writer);
+        ImGui::SetClipboardText(buffer.GetString());
+    }
+
+    // Keep the original Quick Practice values for older adapters and replays.
+    enum class KagerouAngleMode : uint8_t { Random, Fixed, PastedSingle, PastedGroup };
+
     using std::pair;
     struct THPracParam {
         int32_t mode;
@@ -45,6 +155,9 @@ namespace TH14 {
         bool keepSpellDrops;
 
         bool _playLock = false;
+        KagerouAngleMode kagerou_angle_mode;
+        float kagerou_angles[3];
+        KagerouAngleSequence kagerou_sequence;
         void Reset()
         {
             memset(this, 0, sizeof(THPracParam));
@@ -71,6 +184,25 @@ namespace TH14 {
             GetJsonValue(value);
             GetJsonValue(graze);
             GetJsonValue(faketype);
+            bool fixed_kagerou_angles = false;
+            GetJsonValueEx(fixed_kagerou_angles, Bool);
+            if (fixed_kagerou_angles)
+                kagerou_angle_mode = KagerouAngleMode::Fixed;
+            GetJsonArray(kagerou_angles, 3u);
+            if (param.HasMember("kagerou_sequence"))
+                kagerou_sequence.Read(param["kagerou_sequence"]);
+            if (param.HasMember("kagerou_angle_rad")) {
+                if (const auto angle = ReadKagerouRadian(param["kagerou_angle_rad"])) {
+                    kagerou_angle_mode = KagerouAngleMode::PastedSingle;
+                    kagerou_angles[0] = *angle;
+                }
+            }
+            if (param.HasMember("kagerou_group_rad")) {
+                if (const auto group = ReadKagerouAngleGroup(param["kagerou_group_rad"])) {
+                    kagerou_angle_mode = KagerouAngleMode::PastedGroup;
+                    std::copy(group->begin(), group->end(), kagerou_angles);
+                }
+            }
 
             return true;
         }
@@ -102,6 +234,19 @@ namespace TH14 {
                 AddJsonValue(value);
                 AddJsonValue(graze);
                 AddJsonValue(faketype);
+                if (KagerouNonspellIndex(section) >= 0) {
+                    if (kagerou_angle_mode == KagerouAngleMode::PastedGroup) {
+                        param.AddMember("kagerou_group_rad", WriteKagerouAngleGroup(kagerou_angles, jalloc), jalloc);
+                    } else if (kagerou_angle_mode == KagerouAngleMode::PastedSingle) {
+                        param.AddMember("kagerou_angle_rad", kagerou_angles[0], jalloc);
+                    } else if (kagerou_sequence.count) {
+                        param.AddMember("kagerou_sequence", kagerou_sequence.Write(jalloc), jalloc);
+                    } else if (kagerou_angle_mode == KagerouAngleMode::Fixed) {
+                        const bool fixed_kagerou_angles = true;
+                        AddJsonValue(fixed_kagerou_angles);
+                        AddJsonArray(kagerou_angles, 3);
+                    }
+                }
 
                 ReturnJson();
             } else if (mode == 2) {
@@ -120,6 +265,7 @@ namespace TH14 {
             ReturnJson();
         }
     };
+    static_assert(sizeof(THPracParam) == sizeof(QuickPractice::Request::parameters));
     THPracParam thPracParam {};
 
     class THGuiPrac : public Gui::GameGuiWnd {
@@ -140,14 +286,35 @@ namespace TH14 {
         SINGLETON(THGuiPrac)
     public:
 
+        int QuickPracticeSettings(QuickPractice::Edit action, QuickPractice::Request& request)
+        {
+            constexpr auto legacyFields =
+                "mMode, mStage, mWarp, mSection, mPhase, mDlg, mKeepSpellDrops, mCycle, mFakeType, "
+                "mChapter, mScore, mLife, mLifeFragment, mBomb, mBombFragment, mPower, mValue, mGraze";
+            const auto edit = [&](const char* fields, auto&... angles) {
+                return QuickPractice::EditSettings(action, request, fields,
+                    mMode, mStage, mWarp, mSection, mPhase, mDlg, mKeepSpellDrops, mCycle, mFakeType,
+                    mChapter, mScore, mLife, mLifeFragment, mBomb, mBombFragment, mPower, mValue, mGraze,
+                    angles...);
+            };
+            if (action == QuickPractice::Edit::RestoreSettings && edit(legacyFields)) {
+                mKagerouAngles = {};
+                return 1;
+            }
+            auto& [second, third] = mKagerouAngles;
+            return edit("th14-kagerou-angles-v1", second.fixed, second.first, second.second, second.third,
+                third.fixed, third.first, third.second, third.third);
+        }
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4f5834);
-                mShotType = *((int32_t*)0x4f582c);
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4f5834);
+                mShotType = preview ? preview->shot % 2 : *((int32_t*)0x4f582c);
                 SetFade(0.8f, 0.1f);
                 Open();
                 thPracParam.Reset();
@@ -156,6 +323,18 @@ namespace TH14 {
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (const auto* request = QuickPractice::PendingParameters();
+                    request && (request->bytes == 64 || request->bytes == 80)) {
+                    if (QuickPractice::Apply(&thPracParam, request->bytes)) {
+                        if (request->bytes == 64)
+                            thPracParam.kagerou_angle_mode = KagerouAngleMode::Random;
+                        thPracParam.kagerou_sequence = {};
+                        break;
+                    }
+                } else if (QuickPractice::UseParameters(thPracParam)) {
+                    break;
+                }
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -166,6 +345,18 @@ namespace TH14 {
                     thPracParam.dlg = *mDlg;
                 if (SectionHasSpellDrops(thPracParam.section))
                     thPracParam.keepSpellDrops = *mKeepSpellDrops;
+                if (const int index = KagerouNonspellIndex(thPracParam.section); index >= 0) {
+                    auto& angles = mKagerouAngles[index];
+                    if (angles.pasted) {
+                        thPracParam.kagerou_angle_mode = KagerouAngleMode::PastedGroup;
+                        std::copy(angles.pasted->begin(), angles.pasted->end(), thPracParam.kagerou_angles);
+                    } else if (*angles.fixed) {
+                        thPracParam.kagerou_angle_mode = KagerouAngleMode::Fixed;
+                        thPracParam.kagerou_angles[0] = angles.first;
+                        thPracParam.kagerou_angles[1] = angles.second;
+                        thPracParam.kagerou_angles[2] = angles.third;
+                    }
+                }
 
                 thPracParam.score = *mScore;
                 thPracParam.life = *mLife;
@@ -246,8 +437,43 @@ namespace TH14 {
             if (*mMode == 1) {
                 if (mWarp())
                     *mSection = *mChapter = *mPhase = 0;
-                if (*mWarp)
+                if (*mWarp) {
                     SectionWidget();
+                    if (const int index = KagerouNonspellIndex(CalcSection()); index >= 0) {
+                        auto& angles = mKagerouAngles[index];
+                        if (ImGui::Button(S(TH14_KAGEROU_PASTE))) {
+                            const auto group = PasteKagerouAngleGroup(index);
+                            angles.pasteFailed = !group;
+                            if (group)
+                                angles.pasted = group;
+                        }
+                        if (angles.pasted) {
+                            ImGui::SameLine();
+                            if (ImGui::Button(S(TH14_KAGEROU_CLEAR))) {
+                                angles.pasted.reset();
+                                angles.pasteFailed = false;
+                            } else {
+                                ImGui::Text("%.2f° / %.2f° / %.2f°",
+                                    (*angles.pasted)[0] / kKagerouRadiansPerDegree,
+                                    (*angles.pasted)[1] / kKagerouRadiansPerDegree,
+                                    (*angles.pasted)[2] / kKagerouRadiansPerDegree);
+                            }
+                        } else {
+                            angles.fixed();
+                            if (*angles.fixed) {
+                                const auto inputAngle = [](th_glossary_t label, float& degrees) {
+                                    if (ImGui::InputFloat(S(label), &degrees, 0.0f, 0.0f, "%.2f"))
+                                        degrees = std::clamp(degrees, -180.0f, 180.0f);
+                                };
+                                inputAngle(TH14_KAGEROU_ANGLE_FIRST, angles.first);
+                                inputAngle(TH14_KAGEROU_ANGLE_SECOND, angles.second);
+                                inputAngle(TH14_KAGEROU_ANGLE_THIRD, angles.third);
+                            }
+                        }
+                        if (angles.pasteFailed)
+                            ImGui::TextWrapped("%s", S(TH14_KAGEROU_PASTE_ERROR));
+                    }
+                }
                 
                 Gui::PracticeSection(true);
                 mLife();
@@ -413,6 +639,16 @@ namespace TH14 {
         Gui::GuiCombo mCycle { TH_CYCLE, TH14_CYCLE_LIST };
         Gui::GuiCombo mFakeType { TH14_FAKE_TYPE, TH14_FAKE_TYPE_LIST };
 
+        struct KagerouAngles {
+            Gui::GuiCheckBox fixed { TH14_FIXED_KAGEROU_ANGLES };
+            float first = 0.0f;
+            float second = 0.0f;
+            float third = 0.0f;
+            std::optional<KagerouAngleGroup> pasted;
+            bool pasteFailed = false;
+        };
+        std::array<KagerouAngles, 2> mKagerouAngles {};
+
         Gui::GuiSlider<int, ImGuiDataType_S32> mChapter { TH_CHAPTER, 0, 0 };
         Gui::GuiDrag<int64_t, ImGuiDataType_S64> mScore { TH_SCORE, 0, 9999999990, 10, 100000000 };
         Gui::GuiSlider<int, ImGuiDataType_S32> mLife { TH_LIFE, 0, 8 };
@@ -426,7 +662,8 @@ namespace TH14 {
         Gui::GuiNavFocus mNavFocus { TH_STAGE, TH_MODE, TH_WARP, TH_DLG,
             TH_MID_STAGE, TH_END_STAGE, TH_NONSPELL, TH_SPELL, TH_PHASE, TH_CHAPTER,
             TH_SCORE, TH_LIFE, TH_LIFE_FRAGMENT, TH_BOMB, TH_BOMB_FRAGMENT, TH_CYCLE,
-            TH_POWER, TH_VALUE, TH_GRAZE, TH14_FAKE_TYPE };
+            TH_POWER, TH_VALUE, TH_GRAZE, TH14_FAKE_TYPE, TH14_FIXED_KAGEROU_ANGLES,
+            TH14_KAGEROU_ANGLE_FIRST, TH14_KAGEROU_ANGLE_SECOND, TH14_KAGEROU_ANGLE_THIRD };
 
         int mChapterSetup[7][2] {
             { 3, 2 },
@@ -441,6 +678,8 @@ namespace TH14 {
         int mDiffculty = 0;
         int mShotType = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -1598,6 +1837,39 @@ namespace TH14 {
                 wndFocus &= MarisaLaserMenu();
                 EndOptGroup();
             }
+            if (BeginOptGroup<TH14_KAGEROU_RECORD_MENU>()) {
+                if (ImGui::Checkbox(S(TH14_KAGEROU_RECORD), &kagerouRecording)) {
+                    kagerouRecordingStarted.fill(false);
+                    UpdateKagerouAngleHook();
+                }
+                ImGui::TextWrapped("%s", S(TH14_KAGEROU_RECORD_HINT));
+                constexpr th_glossary_t copyLabels[] { TH14_KAGEROU_COPY_SECOND, TH14_KAGEROU_COPY_THIRD };
+                for (int index = 0; index < 2; ++index) {
+                    ImGui::PushID(index);
+                    const auto& record = kagerouRecords[index];
+                    const auto groups = record.count / kKagerouGroupSize;
+                    auto& group = mKagerouGroup[index];
+                    if (groups) {
+                        ImGui::SetNextItemWidth(95.0f);
+                        ImGui::InputInt(S(TH14_KAGEROU_GROUP_INDEX), &group, 1);
+                        group = std::clamp(group, 1, static_cast<int>(groups));
+                        ImGui::SameLine();
+                    }
+                    if (ImGui::Button(S(copyLabels[index])) && groups)
+                        CopyKagerouAngleGroup(index, group);
+                    ImGui::SameLine();
+                    ImGui::Text(S(TH14_KAGEROU_GROUP_COUNT), groups);
+                    if (groups) {
+                        const auto* radians = record.radians + (group - 1) * kKagerouGroupSize;
+                        ImGui::Text("%.2f° / %.2f° / %.2f°",
+                            radians[0] / kKagerouRadiansPerDegree,
+                            radians[1] / kKagerouRadiansPerDegree,
+                            radians[2] / kKagerouRadiansPerDegree);
+                    }
+                    ImGui::PopID();
+                }
+                EndOptGroup();
+            }
             InGameReactionTestOpt();
             AboutOpt("Nylilsa & InceRabbit (for making the video about Marisa's replay desync bug, and for sharing the replay)\n......and you!");
             ImGui::EndChild();
@@ -1606,6 +1878,7 @@ namespace TH14 {
         }
 
         adv_opt_ctx mOptCtx;
+        std::array<int, 2> mKagerouGroup { 1, 1 };
         int mMode = 0;
         char mTempStr[128];
         bool mRecording = false;
@@ -2637,10 +2910,121 @@ namespace TH14 {
             break;
         }
     }
+    static std::array<uintptr_t, 2> kagerouAngleInstructions {};
+    static uint32_t kagerouAngleCursor;
+
+    static int KagerouOverrideIndex()
+    {
+        const auto mode = thPracParam.kagerou_angle_mode;
+        if (thPracParam.mode == 1 && (mode == KagerouAngleMode::Fixed || mode == KagerouAngleMode::PastedGroup
+            || mode == KagerouAngleMode::PastedSingle || thPracParam.kagerou_sequence.count))
+            return KagerouNonspellIndex(thPracParam.section);
+        return -1;
+    }
+
+    EHOOK_ST(th14_kagerou_angle, 0x427e74, 5, {
+        if (pCtx->Esi != 0)
+            return;
+
+        // ins_604 has read both operands and stored the shooter angles.
+        const auto eclContext = GetMemAddr(pCtx->Edi + 0x40ec, 4, 0);
+        const auto instruction = *reinterpret_cast<const uintptr_t*>(eclContext + 4);
+        const auto found = std::find(kagerouAngleInstructions.begin(), kagerouAngleInstructions.end(), instruction);
+        if (!instruction || found == kagerouAngleInstructions.end())
+            return;
+        const auto index = static_cast<int>(found - kagerouAngleInstructions.begin());
+
+        const auto frameOffset = *reinterpret_cast<const uint32_t*>(eclContext + 0x100c);
+        const auto color = *reinterpret_cast<const int32_t*>(eclContext + 8 + frameOffset);
+        // Boss2_at and Boss3_at receive the wave's color as their first argument.
+        const int wave = color == 6 ? 0 : color == 2 ? 1 : color == 4 ? 2 : -1;
+        if (wave < 0)
+            return;
+
+        auto& angle = *reinterpret_cast<float*>(pCtx->Edi + 0x5ac);
+        if (KagerouOverrideIndex() == index) {
+            const auto& sequence = thPracParam.kagerou_sequence;
+            // The original random draw has already run in ins_604.
+            if (thPracParam.kagerou_angle_mode == KagerouAngleMode::PastedGroup) {
+                angle = thPracParam.kagerou_angles[wave];
+            } else if (thPracParam.kagerou_angle_mode == KagerouAngleMode::PastedSingle) {
+                angle = thPracParam.kagerou_angles[0];
+            } else if (sequence.count) {
+                // Old practice replays may still contain a one-pass sequence.
+                if (kagerouAngleCursor < std::min(sequence.count, sequence.capacity))
+                    angle = sequence.radians[kagerouAngleCursor++];
+            } else {
+                const auto degrees = std::clamp(thPracParam.kagerou_angles[wave], -180.0f, 180.0f);
+                angle = degrees * kKagerouRadiansPerDegree;
+            }
+        } else if (kagerouRecording) {
+            auto& record = kagerouRecords[index];
+            if (!kagerouRecordingStarted[index]) {
+                if (wave != 0)
+                    return;
+                record.count = 0;
+                kagerouRecordingStarted[index] = true;
+            }
+            if (record.count == record.capacity)
+                return;
+            const auto pending = record.count % kKagerouGroupSize;
+            if (static_cast<uint32_t>(wave) != pending) {
+                if (wave != 0)
+                    return;
+                record.count -= pending;
+            }
+            record.radians[record.count++] = angle;
+        }
+    });
+
+    static void UpdateKagerouAngleHook()
+    {
+        if ((kagerouRecording || KagerouOverrideIndex() >= 0)
+            && (kagerouAngleInstructions[0] || kagerouAngleInstructions[1])) {
+            th14_kagerou_angle.Setup();
+            th14_kagerou_angle.Enable();
+        } else {
+            th14_kagerou_angle.Disable();
+        }
+    }
+
+    static void ResetKagerouAngleStage()
+    {
+        kagerouAngleCursor = 0;
+        kagerouRecordingStarted.fill(false);
+        kagerouAngleInstructions.fill(0);
+        th14_kagerou_angle.Disable();
+    }
+
+    static void LoadKagerouAngleStage()
+    {
+        if (GetMemContent<int>(STAGE_NUM) != 3)
+            return;
+        const auto manager = GetMemContent<uintptr_t>(ENEMY_MANAGER_PTR);
+        if (!manager)
+            return;
+        const auto scripts = GetMemContent<uintptr_t>(manager + 0xcc);
+        if (!scripts)
+            return;
+        const auto bossScript = GetMemContent<uintptr_t>(scripts + 0x18);
+        if (!bossScript)
+            return;
+        constexpr uintptr_t angleOffsets[] { 0x1478, 0x1e04 };
+        for (size_t index = 0; index < kagerouAngleInstructions.size(); ++index) {
+            const auto instruction = bossScript + angleOffsets[index];
+            if (*reinterpret_cast<const uint16_t*>(instruction + 4) == 604
+                && *reinterpret_cast<const uint16_t*>(instruction + 6) == 28
+                && *reinterpret_cast<const float*>(instruction + 0x14) == -9998.0f)
+                kagerouAngleInstructions[index] = instruction;
+        }
+        UpdateKagerouAngleHook();
+    }
+
     __declspec(noinline) void THSectionPatch()
     {
         ECLHelper ecl;
-        ecl.SetBaseAddr((void*)GetMemAddr(0x4db544, 0xcc, 0xC));
+        const auto files = GetMemAddr(0x4db544, 0xcc, 0xc);
+        ecl.SetBaseAddr(reinterpret_cast<void*>(files));
 
         auto section = thPracParam.section;
         if (section >= 10000 && section < 20000) {
@@ -3020,60 +3404,6 @@ namespace TH14 {
     }
 #pragma warning(pop)
 
-    // Track only ordinary bullets present when a nonspell changes to a spell.
-    // Native TH14 allocates bullets from a fixed pool; creation invalidates an
-    // old slot before it can be reused. This affects statistics only.
-    static std::array<bool, 0x7d1> captureOldBullets {};
-    static uintptr_t captureBulletBase = 0;
-    static bool captureOldCandidate = false, captureWasEligible = false;
-    static bool captureOldHitPending = false, captureIgnoreNativeLoss = false;
-    static int CaptureBulletIndex(uintptr_t bullet)
-    {
-        constexpr uintptr_t stride = 0x13f4;
-        if (!captureBulletBase || bullet < captureBulletBase) return -1;
-        const auto offset = bullet - captureBulletBase;
-        if (offset % stride || offset / stride >= captureOldBullets.size()) return -1;
-        return static_cast<int>(offset / stride);
-    }
-    static void CaptureBulletTransition(bool previousNonspell, bool spell)
-    {
-        captureOldBullets.fill(false);
-        captureBulletBase = 0;
-        captureOldCandidate = captureOldHitPending = captureIgnoreNativeLoss = false;
-        if (!AddonEnabled(Addon::Repairs) || !previousNonspell || !spell) return;
-        const auto manager = BossCaptureReadPointer(0x4db530);
-        if (!manager) return;
-        captureBulletBase = manager + 0x8c;
-        for (size_t i = 0; i < captureOldBullets.size(); ++i)
-            captureOldBullets[i] = (BossCaptureReadPointer(captureBulletBase + i * 0x13f4 + 0x20) & 2) != 0;
-    }
-    static void CaptureBulletBeforeCollision(uintptr_t bullet)
-    {
-        const auto& tracker = BossCapture::Instance();
-        const int index = CaptureBulletIndex(bullet);
-        captureOldCandidate = tracker.Active() && tracker.ActiveKey().game == 14
-            && tracker.ActiveKey().kind == BossCapture::kSpell && index >= 0 && captureOldBullets[index];
-        const auto spell = captureOldCandidate ? BossCaptureReadPointer(0x4db534) : 0;
-        captureWasEligible = spell && (BossCaptureReadPointer(spell + 0x7c) & 2) != 0;
-    }
-    static void CaptureBulletAfterCollision(int result)
-    {
-        const auto player = captureOldCandidate ? BossCaptureReadPointer(0x4db67c) : 0;
-        // TH14 changes player state to 4 only when this collision actually hits.
-        if (result == 1 && player && BossCaptureReadPointer(player + 0x684) == 4) {
-            captureOldHitPending = true;
-            captureIgnoreNativeLoss |= captureWasEligible;
-        }
-        captureOldCandidate = false;
-    }
-    static bool CaptureOldHitConsume()
-    {
-        const bool old = captureOldHitPending;
-        captureOldHitPending = false;
-        return old;
-    }
-    static bool CaptureOldHitEligibilityOverride() { return captureIgnoreNativeLoss; }
-
     // Native capture bridge: only canonical ECL attack roots are recorded.
     static BossCaptureContext CaptureNativeContext()
     {
@@ -3138,6 +3468,7 @@ namespace TH14 {
     })
     EHOOK_DY(th14_param_reset, 0x45a111, 7, {
         thPracParam.Reset();
+        ResetKagerouAngleStage();
         THAdvOptWnd::singleton().ToggleLock(false);
     })
     EHOOK_DY(th14_prac_menu_1, 0x45e768, 7, {
@@ -3170,6 +3501,7 @@ namespace TH14 {
         }
     })
     EHOOK_DY(th14_patch_main, 0x4360ce, 1, {
+        ResetKagerouAngleStage();
         if (thPracParam.mode == 1) {
             *(int32_t*)(0x4f5830) = (int32_t)(thPracParam.score / 10);
             *(int32_t*)(0x4f5864) = thPracParam.life;
@@ -3187,6 +3519,7 @@ namespace TH14 {
             ecl.SetBaseAddr((void*)GetMemAddr(0x4db544, 0xcc, 0xC));
             THPatchSP(ecl);
         }
+        LoadKagerouAngleStage();
         thPracParam._playLock = true;
     })
     EHOOK_DY(th14_bgm, 0x43699a, 2, {
@@ -3195,6 +3528,8 @@ namespace TH14 {
             pCtx->Eip = 0x43699c;
         }
     }) EHOOK_DY(th14_on_restart, 0x447810, 5, {
+        kagerouAngleCursor = 0;
+        kagerouRecordingStarted.fill(false);
         THAdvOptWnd::singleton().ToggleLock(true);
     })
     EHOOK_DY(th14_normal_game_enter, 0x45e63e, 8, {
@@ -3291,7 +3626,6 @@ namespace TH14 {
         ReportPluginStage(nullptr);
         RouteTrace::Instance().NewRun(14);
         BossCaptureNewRun();
-        CaptureBulletTransition(false, false);
         TH14InGameInfo::singleton().mBombCount = 0;
         TH14InGameInfo::singleton().mMissCount = 0;
         TH14InGameInfo::singleton().m05Count = 0;
@@ -3303,13 +3637,12 @@ namespace TH14 {
     EHOOK_DY(th14_bomb_dec, 0x41218A,5, // bomb dec
     {
         TH14InGameInfo::singleton().mBombCount++;
-        captureOldHitPending = false;
         BossCaptureFailed();
     })
     EHOOK_DY(th14_life_dec, 0x44F618,5, // life dec
     {
         TH14InGameInfo::singleton().mMissCount++;
-        FastRetry(thPracParam.mode, !CaptureOldHitConsume());
+        FastRetry(thPracParam.mode);
     })
     EHOOK_DY(th14_get_item, 0x438DF8,6,
     {
@@ -3343,18 +3676,6 @@ namespace TH14 {
         g_lock_timer_flag = true;
     })
 
-    // These hooks observe TH14's bullet collision and pool allocation without
-    // altering the collision result or player state.
-    EHOOK_ADDON_DY(th14_capture_bullet_before, 0x416d7b, 3, (1u << static_cast<unsigned>(Addon::Capture)) | (1u << static_cast<unsigned>(Addon::Repairs)), {
-        CaptureBulletBeforeCollision(pCtx->Esi);
-    })
-    EHOOK_ADDON_DY(th14_capture_bullet_after, 0x416dff, 2, (1u << static_cast<unsigned>(Addon::Capture)) | (1u << static_cast<unsigned>(Addon::Repairs)), {
-        CaptureBulletAfterCollision(static_cast<int>(pCtx->Eax));
-    })
-    EHOOK_ADDON_DY(th14_capture_bullet_spawn, 0x417918, 10, (1u << static_cast<unsigned>(Addon::Capture)) | (1u << static_cast<unsigned>(Addon::Repairs)), {
-        const int index = CaptureBulletIndex(pCtx->Edi);
-        if (index >= 0) captureOldBullets[index] = false;
-    })
     // Capture settlements: the native HP/timeout condition has already succeeded.
     EHOOK_ADDON_DY(th14_capture_hp, 0x42c002, 11, (1u << static_cast<unsigned>(Addon::Capture)), {
         BossCaptureCleared(pCtx->Ebx, false);
@@ -3367,10 +3688,11 @@ namespace TH14 {
         if (static_cast<int32_t>(pCtx->Esi) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th14_capture_observe, 0x42c1d0, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Ecx+0x40ec));
-    })
+    // BossCaptureFrame already observes the primary boss once per game update.
+    // Hooking the ECL interpreter here also ran for every helper/script and
+    // repeatedly rebuilt the capture context during dense spells.
     HOOKSET_ENDDEF() 
+
     // Route reference (F10). Double Dealing Character keeps the centred player
     // position at 0x5E0; 0x5B0 is the previous-frame copy the game keeps for
     // its own backup, so reading it lags one frame.
@@ -3422,9 +3744,9 @@ namespace TH14 {
 
         // Hooks
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
-        BossCaptureSetTransitionObserver(CaptureBulletTransition, CaptureOldHitEligibilityOverride);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(14);
 
         // Reset thPracParam
         thPracParam.Reset();

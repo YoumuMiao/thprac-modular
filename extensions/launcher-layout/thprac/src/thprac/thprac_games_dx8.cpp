@@ -2,14 +2,11 @@
 #include "thprac_games_dx8.h"
 #include "thprac_games.h"
 #include <vector>
-#include "../3rdParties/d3d8/include/d3d8.h"
+#include <legacy-dx8/d3d8.h>
 #include <cstdint>
 #include <imgui.h>
 #include "thprac_games_hooks.h"
-#include "../3rdParties/d3d8/include/d3dx8tex.h"
 #include "thprac_hook.h"
-#pragma comment(lib, "d3dx8.lib")
-
 
 namespace THPrac {
 extern bool g_is_d3d_hooked;
@@ -103,21 +100,6 @@ ImVec2 GetImageInfo8(ImTextureID textureID)
     ((LPDIRECT3DTEXTURE8)textureID)->GetLevelDesc(0, &desc);
     return { (float)desc.Width, (float)desc.Height };
 }
-
-ImTextureID ReadImage8(DWORD device, LPCSTR fileName, LPCSTR srcData, size_t srcSz)
-{
-    ImTextureID tex = nullptr;
-    if (fileName && GetFileAttributesA(fileName) != INVALID_FILE_ATTRIBUTES) {
-        if (D3DXCreateTextureFromFileA((IDirect3DDevice8*)device, fileName, (LPDIRECT3DTEXTURE8*)&tex) != D3D_OK)
-            tex = nullptr;
-    }
-    if (!tex && srcData) {
-        if (D3DXCreateTextureFromFileInMemory((IDirect3DDevice8*)device, srcData, srcSz, (LPDIRECT3DTEXTURE8*)&tex) != D3D_OK)
-            tex = nullptr;
-    }
-    return tex;
-}
-
 
 #pragma region Snapshot
 namespace THSnapshot {

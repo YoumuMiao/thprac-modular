@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -49,7 +50,7 @@ namespace TH12 {
     };
 
     using std::pair;
-    struct THPracParam {
+    struct PracticeFields {
         int32_t mode;
         int32_t stage;
         int32_t section;
@@ -70,15 +71,15 @@ namespace TH12 {
         int32_t sp_phase;
         float phase1, phase2, phase3, phase4;
 
-        std::vector<PlayerDamageSource> reimuADmgSrcs[5];
         bool dlg;
+    };
 
+    struct THPracParam : PracticeFields {
+        std::vector<PlayerDamageSource> reimuADmgSrcs[5];
         bool _playLock = false;
         void Reset()
         {
-            for (size_t st = 0; st < elementsof(reimuADmgSrcs); ++st)
-                reimuADmgSrcs[st].clear();
-            memset(this, 0, sizeof(THPracParam));
+            *this = THPracParam {};
         }
         bool ReadJson(std::string& json)
         {
@@ -216,13 +217,21 @@ namespace TH12 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mUfoSide, mVentra1, mVentra2, mVentra3,
+            mChapter, mScore, mLife, mLifeFragment, mBomb,
+            mBombFragment, mPower, mValue, mGraze, mSpPhaseA,
+            mSpPhase1, mSpPhase2, mSpPhaseB, mSpPhase3, mSpPhase4)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4aebd0);
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4aebd0);
                 SetFade(0.8f, 0.1f);
                 Open();
                 thPracParam.Reset();
@@ -232,6 +241,8 @@ namespace TH12 {
                 SetFade(0.8f, 0.1f);
                 Close();
                 *mNavFocus = 0;
+
+                if (QuickPractice::UseParameters(static_cast<PracticeFields&>(thPracParam))) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -548,6 +559,8 @@ namespace TH12 {
 
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR_FIELDS(PracticeFields)
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -587,7 +600,7 @@ namespace TH12 {
             case 3:
                 mRepStatus = true;
                 if (mParamStatus)
-                    memcpy(&thPracParam, &mRepParam, sizeof(THPracParam));
+                    thPracParam = mRepParam;
                 break;
             default:
                 break;
@@ -2443,9 +2456,6 @@ namespace TH12 {
         if (static_cast<int32_t>(pCtx->Esi) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th12_capture_observe, 0x41a900, 6, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Eax+0x174c));
-    })
     HOOKSET_ENDDEF()
 
     // Route reference (F10). The position pair offset inside the player object
@@ -2500,6 +2510,7 @@ namespace TH12 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(12);
 
         // Reset thPracParam
         thPracParam.Reset();

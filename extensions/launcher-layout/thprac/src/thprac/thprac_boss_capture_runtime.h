@@ -15,9 +15,6 @@ struct BossCaptureContext {
     uintptr_t bosses[8] {};
 };
 using BossCaptureContextProvider = BossCaptureContext(*)();
-using BossCaptureTransitionObserver = void(*)(bool, bool);
-using BossCaptureEligibilityOverride = bool(*)();
-void BossCaptureSetTransitionObserver(BossCaptureTransitionObserver, BossCaptureEligibilityOverride);
 using BossCaptureLabelProvider = const char*(*)(int section, int difficulty);
 void BossCaptureAttach(BossCaptureContextProvider context, BossCaptureLabelProvider label);
 void BossCaptureNewRun();
@@ -27,6 +24,28 @@ void BossCaptureFailed();
 void BossCapturePlayerHit();
 // Authoritative native success, independent of HP/timeout script transitions.
 void BossCaptureSpellCaptured(uintptr_t owner);
+// Snapshot the outgoing spell before its native finalizer. The result is
+// applied to that same attempt even if ECL switches attacks inside the call.
+struct BossCaptureNativeSpellEvent {
+    BossCapture::Key key {};
+    uintptr_t owner = 0;
+    uint64_t frame = 0;
+    bool valid = false;
+};
+BossCaptureNativeSpellEvent BossCaptureNativeSpellBefore(uintptr_t owner);
+void BossCaptureNativeSpellAfter(const BossCaptureNativeSpellEvent&, bool captured);
+bool BossCaptureInstallNativeSpellEvents(int game);
+void BossCaptureNativeSpellSucceeded();
+void BossCaptureReadBossHandles(int game, uintptr_t manager, unsigned slotsOffset,
+    unsigned listOffset, unsigned idOffset, uintptr_t (&bosses)[8]);
+inline bool BossCaptureHasNativeSpellEvents(int game)
+{
+    switch (game) {
+    case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14:
+    case 16: case 17: case 18: case 20: return true;
+    default: return false; // TH15 owns its chapter/native-event implementation.
+    }
+}
 void BossCaptureFrame();
 // TH07 uses separate stage scripts for Extra (7) and Phantasm (8).
 inline bool BossCaptureStageMatchesDifficulty(int game, int stage, int difficulty)
@@ -53,7 +72,6 @@ void BossCaptureOptions();
 void BossCaptureConfigured(uintptr_t owner, uintptr_t instruction);
 void BossCaptureConfiguredCurrent(uintptr_t owner);
 void BossCaptureObservedCurrent(uintptr_t owner);
-void BossCaptureEclArguments20(uintptr_t owner);
 void BossCaptureCleared(uintptr_t owner, bool timeout = false);
 void BossCaptureScriptExit(uintptr_t owner);
 uintptr_t BossCaptureCurrentInstruction(uintptr_t owner);

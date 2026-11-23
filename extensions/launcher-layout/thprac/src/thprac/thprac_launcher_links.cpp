@@ -4,8 +4,10 @@
 #include "thprac_gui_locale.h"
 #include "thprac_utils.h"
 #include "utils/utils.h"
+#include <algorithm>
 #include <functional>
 #include <imgui.h>
+#include <initializer_list>
 #pragma warning(push)
 #pragma warning(disable : 26451)
 #pragma warning(disable : 26495)
@@ -13,6 +15,7 @@
 #include <rapidjson/document.h>
 #pragma warning(pop)
 #include <string>
+#include <string_view>
 #include <vector>
 
 
@@ -64,6 +67,10 @@ private:
 #define DEFAULT_KEY "Default##1"
 #define DEFAULT_LINKS R"123({
 "__is_open__" : true,
+"GitHub (RUEEE/thprac)"                        :"https://github.com/RUEEE/thprac",
+"GitHub (YoumuMiao/thprac-modular)"            :"https://github.com/YoumuMiao/thprac-modular",
+"THBWiki"                                     :"https://thwiki.cc/",
+"Touhou Online"                               :"https://touhouonline.com/",
 "Royalflare Archive"                          :"https://maribelhearn.com/royalflare",
 "Maribel Hearn's Touhou Portal"               :"https://maribelhearn.com/",
 "PND"                                         :"https://thscore.pndsng.com/index.php",
@@ -76,12 +83,10 @@ private:
 "Touhou Replay Showcase"                      :"https://twitch.tv/touhou_replay_showcase",
 "--------------------------------"            :" ",
 "甜品站 (isndes)"                             :"https://www.isndes.com/",
-"THBWiki"                                     :"https://thwiki.cc/",
 "莉莉云"                                      :"https://cn.thdog.moe/",
 "从夯到拉排行制作器"                          :"https://maribelhearn.com/tiers",
 "--------------------------------"            :" ",
 "github(TWC)"                                 :"https://github.com/touhouworldcup/thprac/",
-"github(R)"                                   :"https://github.com/RUEEE/thprac",
 "--------------------------------"            :" ",
 "东方正作STG的各种设置和插件指南"             :"https://www.bilibili.com/opus/974491967425609731",
 "东方STG常用工具、网址等资源汇总"             :"https://www.bilibili.com/opus/411007775865615066",
@@ -164,6 +169,52 @@ private:
         JsonAddMemberA(cfg, "links", linksJson, cfg.GetAllocator());
         LauncherCfgWrite();
     }
+    void SeedLinkShortcuts(const char* seedKey, std::initializer_list<const char*> names, int filterState)
+    {
+        auto& cfg = LauncherCfgGet();
+        if (cfg.HasMember(seedKey)) {
+            return;
+        }
+
+        rapidjson::Document defaults;
+        defaults.Parse(default_links);
+        LinkNode newGroup;
+        newGroup.name = default_name;
+        newGroup.isOpen = filterState != 2;
+        const auto defaultGroup = std::ranges::find_if(mLinks, [&](const LinkNode& node) {
+            return node.name == default_name;
+        });
+        auto& group = defaultGroup == mLinks.end() ? newGroup : *defaultGroup;
+        const auto withoutTrailingSlash = [](std::string_view url) {
+            if (url.ends_with('/')) {
+                url.remove_suffix(1);
+            }
+            return url;
+        };
+        for (const char* name : names) {
+            const std::string_view url = defaults[name].GetString();
+            const auto hasUrl = [&](const LinkLeaf& leaf) {
+                return withoutTrailingSlash(leaf.link) == withoutTrailingSlash(url);
+            };
+            if (std::ranges::any_of(mLinks, [&](const LinkNode& node) {
+                    return std::ranges::any_of(node.leaves, hasUrl);
+                })) {
+                continue;
+            }
+
+            std::string label = name;
+            for (int suffix = 2; std::ranges::any_of(group.leaves, [&](const LinkLeaf& leaf) {
+                     return leaf.name == label;
+                 }); ++suffix) {
+                label = std::string(name) + " (" + std::to_string(suffix) + ")";
+            }
+            group.leaves.push_back({ {}, std::move(label), std::string(url) });
+        }
+        if (!newGroup.leaves.empty()) {
+            mLinks.insert(mLinks.begin(), std::move(newGroup));
+        }
+        JsonAddMember(cfg, seedKey, true, cfg.GetAllocator());
+    }
     bool LoadLinksCfg()
     {
         bool result = true;
@@ -208,6 +259,8 @@ private:
             }
         }
 
+        SeedLinkShortcuts("links_shortcuts_v1", { "GitHub (RUEEE/thprac)", "THBWiki", "Touhou Online" }, filterState);
+        SeedLinkShortcuts("links_shortcuts_v2", { "GitHub (YoumuMiao/thprac-modular)" }, filterState);
         WriteLinksCfg();
         return result;
     }

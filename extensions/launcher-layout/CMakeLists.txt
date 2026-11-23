@@ -2,18 +2,20 @@ include(sources.cmake)
 set(vendor "${CMAKE_CURRENT_SOURCE_DIR}/thprac/src/3rdParties")
 set(prac "${CMAKE_CURRENT_SOURCE_DIR}/thprac/src/thprac")
 
-add_library(thprac_layout_support STATIC ${THPRAC_LAYOUT_SOURCES} feature_runtime.cpp ../capture/adapter.cpp
+add_library(thprac_layout_support STATIC ${THPRAC_LAYOUT_SOURCES} feature_runtime.cpp quick_practice_adapter.cpp
+    quick_practice_launcher.cpp ../capture/adapter.cpp ../game-bgm/launcher_panel.cpp
+    "${PROJECT_SOURCE_DIR}/thprac/src/thprac/thprac_dx8_image.cpp"
     "${PROJECT_SOURCE_DIR}/thprac/src/thprac/thprac_extension_manager.cpp"
     "${PROJECT_SOURCE_DIR}/thprac/src/thprac/thprac_extension_inventory.cpp")
 thprac_native(thprac_layout_support)
 target_include_directories(thprac_layout_support PRIVATE "${PROJECT_SOURCE_DIR}/thprac/src/thprac")
 target_compile_definitions(thprac_layout_support PUBLIC HAVE_SSE2 DISTORM_LIGHT _WINDOWS MS_TOOLSET_VERSION=${MSVC_TOOLSET_VERSION})
 target_compile_options(thprac_layout_support PUBLIC $<$<COMPILE_LANGUAGE:C,CXX>:/fp:fast>)
-target_include_directories(thprac_layout_support PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/thprac" "${prac}" "${CMAKE_CURRENT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/sdk" "${CMAKE_CURRENT_SOURCE_DIR}/../capture" "${CMAKE_CURRENT_SOURCE_DIR}/../route" "${CMAKE_CURRENT_SOURCE_DIR}/../repairs"
+target_include_directories(thprac_layout_support PUBLIC "${legacy_headers}" "${CMAKE_CURRENT_SOURCE_DIR}/thprac" "${prac}" "${CMAKE_CURRENT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/sdk" "${CMAKE_CURRENT_SOURCE_DIR}/../capture" "${CMAKE_CURRENT_SOURCE_DIR}/../route" "${CMAKE_CURRENT_SOURCE_DIR}/../repairs"
     "${vendor}/rapidjson/include" "${vendor}/MetroHash" "${vendor}/distorm/include"
     "${vendor}/ImGui" "${vendor}/FreeType/include" "${vendor}/MinHook/include")
 target_link_directories(thprac_layout_support PUBLIC
-    "${vendor}/FreeType/win32" "${vendor}/d3d8/lib" "${vendor}/d3d9/lib" "${vendor}/minizip/lib")
+    "${vendor}/FreeType/win32" "${vendor}/minizip/lib")
 target_link_libraries(thprac_layout_support PUBLIC kernel32 ntdll user32 freetype gdi32 gdiplus dxguid d3d9
     xinput winmm dinput8 ws2_32 Shlwapi ole32 comdlg32 shell32 advapi32 delayimp dsound)
 
@@ -25,7 +27,8 @@ target_link_libraries(launcher_layout PRIVATE thprac_layout_support)
 
 
 include(adapter_sources.cmake)
-thprac_c7_extension(game_adapter game ../game-adapter/entry.cpp ${THPRAC_ADAPTER_SOURCES} "${prac}/blobs/th19_fast_msvc.obj")
+thprac_c7_extension(game_adapter game ../game-adapter/entry.cpp ../game-adapter/practice_editor.cpp
+    ${THPRAC_ADAPTER_SOURCES} "${prac}/blobs/th19_fast_msvc.obj")
 target_link_libraries(game_adapter PRIVATE thprac_layout_support)
 target_link_options(game_adapter PRIVATE /FORCE:MULTIPLE /IGNORE:4098 /IGNORE:4204)
 

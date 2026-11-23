@@ -2,6 +2,9 @@ param(
     [string]$MsvcRoot,
     [string]$SdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10",
     [string]$SdkVersion = '10.0.26100.0',
+    [string]$Dx8Sdk = $env:THPRAC_DX8_SDK,
+    [string]$ThtkSource,
+    [string]$ThtkBuild,
     [string]$BuildDir = 'build-win32',
     [int]$Jobs = 6
 )
@@ -26,9 +29,21 @@ if (!(Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     throw 'Use an x86 Native Tools PowerShell, or pass -MsvcRoot.'
 }
 
+$definitions = @()
+if ($Dx8Sdk) {
+    $definitions += "-DTHPRAC_DX8_SDK=$((Resolve-Path -LiteralPath $Dx8Sdk).Path)"
+}
+if ($ThtkSource -or $ThtkBuild) {
+    if (!$ThtkSource -or !$ThtkBuild) {
+        throw 'Pass both -ThtkSource and -ThtkBuild to enable the BGM repacker.'
+    }
+    $definitions += "-DTHPRAC_THTK_SOURCE=$((Resolve-Path -LiteralPath $ThtkSource).Path)"
+    $definitions += "-DTHPRAC_THTK_BUILD=$((Resolve-Path -LiteralPath $ThtkBuild).Path)"
+}
+
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=cl.exe" "-DCMAKE_CXX_COMPILER=cl.exe"
+    cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=cl.exe" "-DCMAKE_CXX_COMPILER=cl.exe" @definitions
     if ($LASTEXITCODE) { throw "CMake configuration failed ($LASTEXITCODE)" }
     cmake --build $BuildDir --parallel $Jobs
     if ($LASTEXITCODE) { throw "Win32 build failed ($LASTEXITCODE)" }

@@ -5,8 +5,7 @@ struct CaptureSpan { size_t file, begin, end; int section, kind; unsigned diffic
 #include "thprac_boss_capture_catalog.inl"
 BossCaptureContextProvider captureContext = nullptr;
 BossCaptureLabelProvider captureLabel = nullptr;
-BossCaptureTransitionObserver captureTransitionObserver = nullptr;
-BossCaptureEligibilityOverride captureEligibilityOverride = nullptr;
+void (*captureNativeReset)() = nullptr;
 struct CaptureConfiguration { BossCapture::Key key; uint64_t failures; bool hasPattern; };
 std::map<uintptr_t, CaptureConfiguration> captureConfigured;
 std::map<std::pair<size_t,uintptr_t>, bool> captureFileIdentity;
@@ -19,8 +18,38 @@ bool captureTh10MomijiDefeated = false;
 bool captureTh12Checkpoint = false;
 BossCapture::Outcome capturePendingOutcome = BossCapture::kCaptured;
 uint64_t capturePendingFrame = 0;
-struct CaptureSettlement { BossCapture::Key key; bool failed; BossCapture::Outcome outcome; uint64_t frame; bool nativeCaptured = false; };
+struct CaptureSettlement { BossCapture::Key key; bool failed; BossCapture::Outcome outcome; uint64_t frame; bool nativeCaptured = false; uintptr_t owner = 0; bool nativeResolved = false; };
 std::vector<CaptureSettlement> captureSettlements;
+struct CaptureBossHandleCache { uintptr_t manager = 0; uint32_t ids[8] {}; uintptr_t owners[8] {}; uint64_t frame = UINT64_MAX; };
+CaptureBossHandleCache captureBossHandles[21] {};
+void CaptureResetBossHandles() { for (auto& entry : captureBossHandles) entry = {}; }
+void CaptureInvalidateBossHandles() { for (auto& entry : captureBossHandles) entry.frame = UINT64_MAX; }
+void CaptureScanBossHandles(uintptr_t manager, unsigned listOffset, unsigned idOffset,
+    const uint32_t (&ids)[8], uintptr_t (&owners)[8]) {
+    // Runs synchronously on the game's update thread. Walk the native-owned
+    // list once, rather than VirtualQuery for every entity/slot. Invalid or
+    // disappearing storage fails closed instead of retaining a stale owner.
+    __try {
+        auto node = *reinterpret_cast<const uintptr_t*>(manager + listOffset);
+        for (unsigned count = 0; node && count < 4096; ++count) {
+            const auto owner = *reinterpret_cast<const uintptr_t*>(node);
+            if (owner) {
+                const auto id = *reinterpret_cast<const uint32_t*>(owner + idOffset);
+                for (unsigned slot = 0; slot < 8; ++slot)
+                    if (ids[slot] && ids[slot] != UINT32_MAX && id == ids[slot]) owners[slot] = owner;
+            }
+            bool complete = true;
+            for (unsigned slot = 0; slot < 8; ++slot)
+                if (ids[slot] && ids[slot] != UINT32_MAX && !owners[slot]) complete = false;
+            if (complete) break;
+            const auto next = *reinterpret_cast<const uintptr_t*>(node + 4);
+            if (next == node) break;
+            node = next;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        for (auto& owner : owners) owner = 0;
+    }
+}
 template<class T> T CaptureRead(uintptr_t address) {
     MEMORY_BASIC_INFORMATION region {};
     if (!address || !VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region))
@@ -77,7 +106,7 @@ void CaptureConfirm() {
     BossCapture::Log("settle th{:02} stage={} attack={} kind={} failed={} outcome={}",
         tracker.ActiveKey().game, tracker.ActiveKey().stage, tracker.ActiveKey().attack,
         tracker.ActiveKey().kind, capturePendingFailed, static_cast<int>(capturePendingOutcome));
-    captureSettlements.push_back({tracker.ActiveKey(), capturePendingFailed, capturePendingOutcome, captureFrameNumber});
+    captureSettlements.push_back({tracker.ActiveKey(), capturePendingFailed, capturePendingOutcome, captureFrameNumber, false, captureOwner});
     tracker.AbortAttack();
     capturePending = false;
     captureOwner = 0;
@@ -90,7 +119,9 @@ void CaptureFlush() {
         const auto& counts = found->second;
         if (counts.captures + counts.timeouts >= counts.attempts) continue;
         if (item.outcome == BossCapture::kTimedOut) store.RecordTimeout(item.key);
-        else if (!item.failed) store.RecordCapture(item.key);
+        else if (!item.failed && (!BossCaptureHasNativeSpellEvents(item.key.game)
+            || item.key.kind != BossCapture::kSpell || item.nativeCaptured))
+            store.RecordCapture(item.key);
     }
     const bool hadSettlements = !captureSettlements.empty();
     captureSettlements.clear();
@@ -98,7 +129,6 @@ void CaptureFlush() {
 }
 void CaptureActivate(uintptr_t owner, const CaptureConfiguration& configured) {
     auto& tracker = BossCapture::Instance();
-    const bool previousNonspell = tracker.Active() && tracker.ActiveKey().kind == BossCapture::kNonSpell;
     if (tracker.Active()) {
         if (tracker.ActiveKey() == configured.key) {
             // Reconfiguring the same named attack is an internal HP/timer phase,
@@ -110,7 +140,6 @@ void CaptureActivate(uintptr_t owner, const CaptureConfiguration& configured) {
         capturePending = false;
     }
     captureTh10MomijiDefeated = false;
-    if (captureTransitionObserver) captureTransitionObserver(previousNonspell, configured.key.kind == BossCapture::kSpell);
     const auto* name = captureLabel ? captureLabel(configured.key.attack, configured.key.difficulty) : nullptr;
     const bool began = tracker.BeginAttack(configured.key.stage, configured.key.attack, configured.key.kind, name ? name : "");
     BossCapture::Log("activate th{:02} stage={} attack={} kind={} diff={} shot={} {}",
@@ -123,22 +152,25 @@ void CaptureActivate(uintptr_t owner, const CaptureConfiguration& configured) {
 }
 struct CaptureCandidate { int section, kind; bool hasPattern; };
 
-// TH08's loader (0x418393..0x418415) adds the image base to all sixteen
-// timeline pointers at +8 and to the subroutine table at +0x48. Compare their
-// original file offsets, not the relocated process addresses, with the catalog.
-// Raw images remain valid too, for callers inspecting an unloaded ECL file.
+// The legacy loaders relocate ECL timeline/subroutine offsets in place. Their
+// table starts differ: TH06 +4/+10, TH07 +4/+44, TH08 +8/+48. Compare original
+// file offsets with the catalog, including unused pointers converted to base.
 bool CaptureHeaderRelocated(const CaptureFile& file, uintptr_t base) {
-    if (file.version != 8) return false;
+    if (file.version < 6 || file.version > 8) return false;
+    const unsigned pointerOffset = file.version == 8 ? 8 : 4;
     uint32_t original = 0;
-    memcpy(&original, file.prefix + 8, sizeof(original));
-    const uint32_t first = CaptureRead<uint32_t>(base + 8);
+    memcpy(&original, file.prefix + pointerOffset, sizeof(original));
+    const uint32_t first = CaptureRead<uint32_t>(base + pointerOffset);
     return first != original && first - static_cast<uint32_t>(base) == original;
 }
 uint8_t CaptureHeaderByte(const CaptureFile& file, uintptr_t base, size_t offset, bool relocated) {
-    const size_t subCount = file.prefix[4] | (static_cast<size_t>(file.prefix[5]) << 8);
-    if (relocated && offset >= 8 && offset < 0x48 + subCount * 4) {
-        const uint32_t relative = CaptureRead<uint32_t>(base + (offset & ~size_t(3)))
-            - static_cast<uint32_t>(base);
+    const unsigned countOffset = file.version == 8 ? 4 : 0;
+    const size_t subCount = file.prefix[countOffset] | (static_cast<size_t>(file.prefix[countOffset + 1]) << 8);
+    const unsigned pointerStart = file.version == 8 ? 8 : 4;
+    const unsigned subStart = file.version == 6 ? 0x10 : file.version == 7 ? 0x44 : 0x48;
+    if (relocated && offset >= pointerStart && offset < subStart + subCount * 4) {
+        const auto value = CaptureRead<uint32_t>(base + (offset & ~size_t(3)));
+        const uint32_t relative = value >= static_cast<uint32_t>(base) ? value - static_cast<uint32_t>(base) : value;
         return static_cast<uint8_t>(relative >> ((offset & 3) * 8));
     }
     return CaptureRead<uint8_t>(base + offset);
@@ -153,20 +185,20 @@ bool CaptureHeaderPrefixMatches(const CaptureFile& file, uintptr_t base, bool re
 // image the game loaded, where the instruction really is, and which catalog
 // files were rejected (range / header prefix / header hash).
 void CaptureDiagnose8(const BossCaptureContext& c, uintptr_t instruction) {
-    if (c.version != 8) return;
+    if (c.version != 6 && c.version != 7 && c.version != 8) return;
     static uint64_t lastLog = 0;
     const uint64_t now = GetTickCount64();
     if (lastLog && now - lastLog < 2000) return;
     lastLog = now;
     const auto base = CaptureRead<uintptr_t>(c.fileTable);
     const auto offset = (base && instruction >= base) ? instruction - base : 0;
-    std::string line = std::format("scan th08 stage={} instr={:#x} base={:#x} off={:#x} hdr=",
-        c.stage, instruction, base, offset);
+    std::string line = std::format("scan th{:02} stage={} instr={:#x} base={:#x} off={:#x} hdr=",
+        c.version, c.stage, instruction, base, offset);
     for (int i = 0; i < 12; ++i)
         line += std::format("{:02x}", CaptureRead<uint8_t>(base + i));
     for (size_t index = 0; index < _countof(captureFiles); ++index) {
         const auto& f = captureFiles[index];
-        if (f.version != 8 || f.stage != c.stage) continue;
+        if (f.version != c.version || f.stage != c.stage) continue;
         const bool relocated = CaptureHeaderRelocated(f, base);
         const bool prefix = CaptureHeaderPrefixMatches(f, base, relocated);
         const bool range = base && instruction >= base && instruction - base < f.size;
@@ -213,10 +245,28 @@ std::vector<CaptureCandidate> CaptureSections(const BossCaptureContext& c, uintp
 }
 } // namespace
 
-void BossCaptureSetTransitionObserver(BossCaptureTransitionObserver observer, BossCaptureEligibilityOverride eligibility) {
-    captureTransitionObserver = observer; captureEligibilityOverride = eligibility;
-}
 uintptr_t BossCaptureReadPointer(uintptr_t address) { return CaptureRead<uintptr_t>(address); }
+void BossCaptureReadBossHandles(int game, uintptr_t manager, unsigned slotsOffset,
+    unsigned listOffset, unsigned idOffset, uintptr_t (&bosses)[8]) {
+    for (auto& boss : bosses) boss = 0;
+    if (game < 0 || game >= static_cast<int>(_countof(captureBossHandles))) return;
+    auto& cache = captureBossHandles[game];
+    if (cache.manager != manager) { cache = {}; cache.manager = manager; }
+    if (!manager) return;
+    bool refresh = cache.frame != captureFrameNumber;
+    for (unsigned slot = 0; slot < 8; ++slot) {
+        const auto id = CaptureRead<uint32_t>(manager + slotsOffset + slot * 4);
+        if (cache.ids[slot] != id) refresh = true;
+        cache.ids[slot] = id;
+        if (cache.owners[slot] && CaptureRead<uint32_t>(cache.owners[slot] + idOffset) != id) refresh = true;
+    }
+    if (refresh) {
+        for (auto& owner : cache.owners) owner = 0;
+        CaptureScanBossHandles(manager, listOffset, idOffset, cache.ids, cache.owners);
+        cache.frame = captureFrameNumber;
+    }
+    for (unsigned slot = 0; slot < 8; ++slot) bosses[slot] = cache.owners[slot];
+}
 void BossCaptureAttach(BossCaptureContextProvider context, BossCaptureLabelProvider label) {
     captureContext = context; captureLabel = label;
     if (!AddonEnabled(Addon::Capture)) return;
@@ -271,9 +321,9 @@ void CaptureIdentify(uintptr_t owner, uintptr_t instruction, const BossCaptureCo
         // Throttled: a boss script that never lands in the catalog must not fill
         // the log, but the first few misses are exactly what a bug report needs.
         static unsigned misses = 0;
-        if (c.version == 8 && (misses++ % 120u) == 0)
-            BossCapture::Log("identify-miss th08 stage={} instr={:#x} opcode={} observed={} primary={:#x}",
-                c.stage, instruction, CaptureRead<uint16_t>(instruction + 4), observed, CapturePrimary(c));
+        if (c.version <= 8 && (misses++ % 120u) == 0)
+            BossCapture::Log("identify-miss th{:02} stage={} instr={:#x} opcode={} observed={} primary={:#x}",
+                c.version, c.stage, instruction, CaptureRead<uint16_t>(instruction + 4), observed, CapturePrimary(c));
         return; // Never substitute a selected practice section for an unknown script.
     }
     CaptureCandidate chosen {};
@@ -312,6 +362,7 @@ void BossCaptureConfiguredCurrent(uintptr_t owner) {
 void BossCaptureConfigured(uintptr_t owner, uintptr_t instruction) {
     if (!AddonEnabled(Addon::Capture)) return;
     if (!captureContext || !owner || !instruction) return;
+    CaptureInvalidateBossHandles();
     const auto c = captureContext();
     auto& tracker = BossCapture::Instance();
     if (c.replay || !c.gameplay || !tracker.Storage().Enabled()) return;
@@ -360,29 +411,6 @@ void BossCaptureObservedCurrent(uintptr_t owner) {
     CaptureIdentify(owner,instruction,c,true,false);
 }
 
-// Called only from TH20's native integer-argument reader. These are the same
-// valid VM pointers that the original reader immediately dereferences. Do the
-// cheap opcode test before consulting any capture context or script catalog.
-void BossCaptureEclArguments20(uintptr_t owner) {
-    if (!AddonEnabled(Addon::Capture)) return;
-    if (!captureContext || !owner || !BossCapture::Instance().Storage().Enabled()) return;
-    const auto thread=*reinterpret_cast<const uintptr_t*>(owner+0xc);
-    if (!thread) return;
-    const int sub=*reinterpret_cast<const int*>(thread+4), offset=*reinterpret_cast<const int*>(thread+8);
-    if (sub<0 || sub>8192 || offset<0 || offset>0x1000000) return;
-    const auto host=*reinterpret_cast<const uintptr_t*>(thread+0x28);
-    if (!host) return;
-    const auto manager=*reinterpret_cast<const uintptr_t*>(host+0x58);
-    if (!manager) return;
-    const auto table=*reinterpret_cast<const uintptr_t*>(manager+0x210);
-    if (!table) return;
-    const auto base=*reinterpret_cast<const uintptr_t*>(table+sub*8+4);
-    if (!base) return;
-    const auto instruction=base+offset+16;
-    const auto opcode=*reinterpret_cast<const uint16_t*>(instruction+4);
-    if (opcode==514 || opcode==512) BossCaptureConfigured(owner,instruction);
-    BossCaptureObservedCurrent(owner);
-}
 void BossCaptureCleared(uintptr_t owner, bool timeout) {
     if (!AddonEnabled(Addon::Capture)) return;
     if (!captureContext || !owner) return;
@@ -400,8 +428,7 @@ void BossCaptureCleared(uintptr_t owner, bool timeout) {
         BossCapture::Log("th10 Momiji defeated; waiting for reinforcements");
         return;
     }
-    if (tracker.ActiveKey().kind == BossCapture::kSpell && !c.spellCapturable
-        && !(captureEligibilityOverride && captureEligibilityOverride())) tracker.MarkFailure();
+    if (tracker.ActiveKey().kind == BossCapture::kSpell && !c.spellCapturable) tracker.MarkFailure();
     capturePending = true;
     capturePendingFailed = tracker.Failed();
     capturePendingOutcome = timeout && !(tracker.ActiveKey().kind == BossCapture::kSpell && c.survival && !tracker.Failed()) ? BossCapture::kTimedOut : BossCapture::kCaptured;
@@ -409,6 +436,7 @@ void BossCaptureCleared(uintptr_t owner, bool timeout) {
 }
 void BossCaptureScriptExit(uintptr_t owner) {
     if (!AddonEnabled(Addon::Capture)) return;
+    CaptureInvalidateBossHandles();
     const auto& tracker = BossCapture::Instance();
     // A scripted departure is not an HP defeat for Momiji.
     if (!capturePending && tracker.Active() && CaptureIsTh10Momiji(tracker.ActiveKey()))
@@ -475,6 +503,63 @@ void BossCaptureSpellCaptured(uintptr_t owner) {
     captureSettlements.back().nativeCaptured = true;
     captureConfigured.erase(owner); // do not restart the completed spell at Frame()
     BossCapture::Log("native-capture th08 attack={}", captureSettlements.back().key.attack);
+}
+BossCaptureNativeSpellEvent BossCaptureNativeSpellBefore(uintptr_t owner) {
+    BossCaptureNativeSpellEvent event;
+    if (!AddonEnabled(Addon::Capture) || !captureContext) return event;
+    const auto c = captureContext();
+    auto& tracker = BossCapture::Instance();
+    if (!BossCaptureHasNativeSpellEvents(c.version) || c.replay || !tracker.Storage().Enabled()) return event;
+    if (!owner) owner = CapturePrimary(c);
+    if (!owner) owner = captureOwner;
+    if (!owner) {
+        for (auto it = captureSettlements.rbegin(); it != captureSettlements.rend(); ++it)
+            if (it->frame == captureFrameNumber && it->key.game == c.version
+                && it->key.kind == BossCapture::kSpell && !it->nativeResolved) { owner = it->owner; break; }
+    }
+    if (!owner) return event;
+    // A next-pattern opcode may already have queued the outgoing spell before
+    // invoking the native end operation. Do not attribute it to the new attack.
+    for (auto it = captureSettlements.rbegin(); it != captureSettlements.rend(); ++it) {
+        if (it->owner == owner && it->frame == captureFrameNumber && !it->nativeResolved
+            && it->key.game == c.version && it->key.kind == BossCapture::kSpell) {
+            event = {it->key, owner, captureFrameNumber, true};
+            return event;
+        }
+    }
+    if (tracker.Active() && captureOwner == owner && tracker.ActiveKey().game == c.version
+        && tracker.ActiveKey().kind == BossCapture::kSpell)
+        event = {tracker.ActiveKey(), owner, captureFrameNumber, true};
+    return event;
+}
+void BossCaptureNativeSpellAfter(const BossCaptureNativeSpellEvent& event, bool captured) {
+    if (!event.valid || !BossCaptureHasNativeSpellEvents(event.key.game) || event.key.kind != BossCapture::kSpell
+        || !AddonEnabled(Addon::Capture) || !captureContext) return;
+    const auto c = captureContext();
+    auto& tracker = BossCapture::Instance();
+    if (c.version != event.key.game || c.replay || !tracker.Storage().Enabled() || event.frame != captureFrameNumber
+        || c.difficulty != event.key.difficulty || c.shot != event.key.shot) return;
+    for (auto it = captureSettlements.rbegin(); it != captureSettlements.rend(); ++it) {
+        if (it->owner != event.owner || it->frame != event.frame || !(it->key == event.key)) continue;
+        if (it->nativeResolved) return; // one native result belongs to exactly one attempt
+        it->failed = !captured;
+        it->nativeCaptured = captured;
+        it->nativeResolved = true;
+        if (captured) it->outcome = BossCapture::kCaptured;
+        BossCapture::Log("native-result th{:02} attack={} captured={} queued=true", event.key.game, event.key.attack, captured);
+        return;
+    }
+    if (!tracker.Active() || captureOwner != event.owner || !(tracker.ActiveKey() == event.key)) return;
+    const bool timeout = capturePending && capturePendingOutcome == BossCapture::kTimedOut;
+    capturePending = true;
+    capturePendingFailed = !captured;
+    capturePendingOutcome = !captured && timeout ? BossCapture::kTimedOut : BossCapture::kCaptured;
+    capturePendingFrame = captureFrameNumber;
+    CaptureConfirm();
+    captureSettlements.back().nativeCaptured = captured;
+    captureSettlements.back().nativeResolved = true;
+    captureConfigured.erase(event.owner);
+    BossCapture::Log("native-result th{:02} attack={} captured={} queued=false", event.key.game, event.key.attack, captured);
 }
 void BossCaptureTh07Stage6Opening(uintptr_t instruction) {
     if (!AddonEnabled(Addon::Capture) || !captureContext || !instruction) return;
@@ -587,6 +672,8 @@ void BossCaptureTh10MomijiFinish(bool practiceExit) {
 
 void BossCaptureCancelTracking() {
     if (!AddonEnabled(Addon::Capture)) return;
+    if (captureNativeReset) captureNativeReset();
+    CaptureResetBossHandles();
     captureTh10MomijiDefeated = false;
     captureTh12Checkpoint = false;
     BossCapture::Instance().AbortAttack();
@@ -595,6 +682,8 @@ void BossCaptureCancelTracking() {
 }
 void BossCaptureNewRun() {
     if (!AddonEnabled(Addon::Capture)) return;
+    if (captureNativeReset) captureNativeReset();
+    CaptureResetBossHandles();
     CaptureFlush();
     BossCapture::Instance().Flush();
     BossCapture::Instance().AbortAttack();

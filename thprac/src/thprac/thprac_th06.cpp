@@ -3,11 +3,11 @@
 #include "thprac_games_dx8.h"
 
 #include "thprac_utils.h"
-#include "../3rdParties/d3d8/include/d3d8.h"
+#include <legacy-dx8/d3d8.h>
 #include <fstream>
 
 #include <format>
-#include "../3rdParties/d3d8/include/dsound.h"
+#include <legacy-dx8/dsound.h>
 
 
 #include "thprac_res.h"

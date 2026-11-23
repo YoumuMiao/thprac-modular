@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include "thprac_launcher_games.h"
+#include <filesystem>
 #include "thprac_gui_components.h"
 #include "thprac_gui_locale.h"
 #include "thprac_launcher_cfg.h"
@@ -10,6 +11,7 @@
 #include "thprac_launcher_utils.h"
 #include "thprac_launcher_wnd.h"
 #include "thprac_load_exe.h"
+#include "quick_practice_launcher.h"
 #include "thprac_main.h"
 #include "thprac_utils.h"
 #include <Windows.h>
@@ -24,6 +26,8 @@
 #include <unordered_map>
 #include <format>
 #include <algorithm>
+#include <atomic>
+#include <optional>
 #include <cfloat>
 #include <cmath>
 #include <cwctype>
@@ -2687,8 +2691,9 @@ public:
             if (!(json.Parse((const char*)jsBuffer, jsSize + 1).HasParseError()) && json.IsObject()) {
                 for (auto it = json.MemberBegin(); it != json.MemberEnd(); ++it) {
                     if (it->value.IsString() && !strcmp(it->name.GetString(), idStr)) {
+                        auto path = utf8_to_utf16(it->value.GetString());
                         free(jsBuffer);
-                        return std::wstring(utf8_to_utf16(it->value.GetString()));
+                        return path;
                     }
                 }
             }
@@ -2697,7 +2702,8 @@ public:
 
         return std::wstring();
     }
-    static HANDLE WINAPI LaunchGameDirectly(THGame* currentGame, int instance)
+    static HANDLE WINAPI LaunchGameDirectly(THGame* currentGame, int instance,
+        const QuickPractice::Service* practice = nullptr, const QuickPractice::Request* request = nullptr)
     {
         bool result = true;
         if (!currentGame) {
@@ -2707,11 +2713,12 @@ public:
         auto currentInstPath = utf8_to_utf16(currentInst.path.c_str());
         auto currentInstDir = GetDirFromFullPath(currentInstPath);
 
-        STARTUPINFOW startup_info;
-        PROCESS_INFORMATION proc_info;
-        memset(&startup_info, 0, sizeof(STARTUPINFOW));
-        startup_info.cb = sizeof(STARTUPINFOW);
-        CreateProcessW(currentInstPath.c_str(), nullptr, nullptr, nullptr, false, CREATE_SUSPENDED, nullptr, currentInstDir.c_str(), &startup_info, &proc_info);
+        STARTUPINFOW startup_info { sizeof(startup_info) };
+        PROCESS_INFORMATION proc_info {};
+        if (!CreateProcessW(currentInstPath.c_str(), nullptr, nullptr, nullptr, false, CREATE_SUSPENDED,
+                nullptr, currentInstDir.c_str(), &startup_info, &proc_info)) return nullptr;
+        void* ticket = nullptr;
+        defer(if (ticket) practice->close(ticket));
 
         uintptr_t base = GetGameModuleBase(proc_info.hProcess);
 
@@ -2721,14 +2728,16 @@ public:
                 auto oilpNameLength = (path.size() + 1) * sizeof(wchar_t);
                 auto pLoadLibrary = ::LoadLibraryW;
                 auto remoteStr = VirtualAllocEx(proc_info.hProcess, NULL, oilpNameLength, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-                if (!remoteStr)
-                    return 0;
-                defer(VirtualFreeEx(proc_info.hProcess, remoteStr, 0, MEM_RELEASE));
-                WriteProcessMemory(proc_info.hProcess, remoteStr, path.data(), oilpNameLength, NULL);
-                auto t = CreateRemoteThread(proc_info.hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, remoteStr, 0, NULL);
-                if (t) {
-                    WaitForSingleObject(t, INFINITE);
-                    CloseHandle(t);
+                if (remoteStr) {
+                    defer(VirtualFreeEx(proc_info.hProcess, remoteStr, 0, MEM_RELEASE));
+                    WriteProcessMemory(proc_info.hProcess, remoteStr, path.data(), oilpNameLength, NULL);
+                    auto t = CreateRemoteThread(proc_info.hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, remoteStr, 0, NULL);
+                    if (t) {
+                        WaitForSingleObject(t, INFINITE);
+                        CloseHandle(t);
+                    }
+                } else {
+                    result = false;
                 }
             }
         }
@@ -2744,7 +2753,14 @@ public:
                 }
             }
         }
-        if (currentInst.useTHPrac) {
+        if (result && practice) {
+            ExeSig signature {};
+            result = GetExeInfoEx(reinterpret_cast<uintptr_t>(proc_info.hProcess), base, signature)
+                && std::any_of(std::begin(gGameDefs), std::end(gGameDefs), [&](const THGameSig& game) {
+                    return strcmp(request->game, game.idStr) == 0 && game.exeSig.timeStamp == signature.timeStamp
+                        && game.exeSig.textSize == signature.textSize;
+                }) && QuickPractice::Apply(proc_info.hProcess, base, *practice, *request, ticket);
+        } else if (result && currentInst.useTHPrac) {
             result = (ApplyGameRuntime(proc_info.hProcess, base));
         }
 
@@ -2755,6 +2771,8 @@ public:
         }
 
         CloseHandle(proc_info.hThread);
+        if (result && practice)
+            result = QuickPractice::WaitForEntry(proc_info.hProcess, *practice, ticket, THGameGui::singleton().mLaunchAbortInd);
         if (result) {
             return proc_info.hProcess;
         } else {
@@ -2762,6 +2780,7 @@ public:
             return 0;
         }
     }
+
     static DWORD WINAPI LaunchThreadFunc([[maybe_unused]] _In_ LPVOID lpParameter)
     {
         auto currentGame = THGameGui::singleton().mCurrentGame;
@@ -2769,6 +2788,17 @@ public:
             return 0;
         }
         auto& currentInst = currentGame->instances[currentGame->selected];
+        const auto& gui = THGameGui::singleton();
+        if (gui.mPracticeLaunch) {
+            const auto& practice = *gui.mPracticeLaunch;
+            if (currentInst.type == TYPE_THCRAP)
+                return QuickPractice::LaunchThcrap(gui.mThcrapDir, utf8_to_utf16(currentInst.path.c_str()),
+                    *practice.service, practice.request, gui.mLaunchAbortInd);
+            const auto process = LaunchGameDirectly(currentGame, currentGame->selected, practice.service, &practice.request);
+            if (!process) return 0;
+            CloseHandle(process);
+            return 1;
+        }
         auto currentCatagory = currentGame->signature.catagory;
         auto currentInstPath = utf8_to_utf16(currentInst.path.c_str());
         auto currentInstExePath = currentInstPath;
@@ -2938,6 +2968,84 @@ public:
         mLaunchThread.Start();
         mLaunchModalTimeout = 0.5f;
     }
+
+    struct PracticeLaunch {
+        const QuickPractice::Service* service;
+        QuickPractice::Request request;
+    };
+
+    const char* PracticeTitle() const
+    {
+        return Gui::DesignText("快速练习", "Quick Practice", "クイック練習");
+    }
+
+    QuickPractice::LauncherSources PracticeSources()
+    {
+        if (!mCurrentGame || mCurrentGame->instances.empty()) return {};
+        switch (mCurrentGame->instances[mCurrentGame->selected].type) {
+        case TYPE_ORIGINAL:
+        case TYPE_MODDED:
+        case TYPE_SCHINESE:
+        case TYPE_TCHINESE:
+        case TYPE_STEAM:
+        case TYPE_THCRAP:
+            return QuickPractice::GetLauncherSources(mCurrentGame->signature.idStr);
+        default:
+            return {};
+        }
+    }
+
+    bool DrawPracticeDialog(const QuickPractice::LauncherSources& sources, bool reset)
+    {
+        const auto* game = mCurrentGame->signature.idStr;
+        const bool opening = reset;
+        if (reset) {
+            mPracticeRequest = {};
+            strcpy_s(mPracticeRequest.game, game);
+            QuickPractice::RestoreLauncherSelection(*sources.service, mPracticeRequest);
+        }
+        const auto display = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowSize(ImVec2(std::min(690.0f, display.x * 0.94f), display.y * 0.88f), ImGuiCond_Appearing);
+        if (!ImGui::BeginPopupModal("##quick_practice", nullptr, ImGuiWindowFlags_NoTitleBar)) return false;
+
+        ImGui::TextUnformatted(PracticeTitle());
+        ImGui::TextDisabled("%s", mCurrentGame->instances[mCurrentGame->selected].name.c_str());
+        ImGui::Separator();
+        ImGui::BeginChild("##practice_options", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()));
+        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.57f);
+        const char* ranks[] = {"Easy", "Normal", "Hard", "Lunatic"};
+        reset |= ImGui::Combo(S(TH_DIFFICULTY), &mPracticeRequest.difficulty, ranks, IM_ARRAYSIZE(ranks));
+        const auto* roll = std::find_if(std::begin(gGameRoll), std::end(gGameRoll),
+            [game](const GameRoll& item) { return strcmp(item.name, game) == 0; });
+        if (roll != std::end(gGameRoll)) {
+            reset |= ImGui::Combo(Gui::DesignText("机体", "Shot", "機体"), &mPracticeRequest.shot, S(roll->shottypes));
+        }
+        QuickPractice::EditorContext context { ImGui::GetCurrentContext(), Gui::LocaleGet() };
+        ImGui::GetAllocatorFunctions(&context.alloc, &context.free, &context.allocContext);
+        if (reset) sources.editor(game, &context, QuickPractice::Edit::Reset, &mPracticeRequest);
+        if (opening && mPracticeRequest.bytes)
+            sources.editor(game, &context, QuickPractice::Edit::RestoreSettings, &mPracticeRequest);
+        sources.editor(game, &context, QuickPractice::Edit::Draw, &mPracticeRequest);
+        if (sources.editor(game, &context, QuickPractice::Edit::SnapshotSettings, &mPracticeRequest)
+            && !ImGui::IsAnyItemActive())
+            QuickPractice::SaveLauncherSelection(mPracticeRequest);
+        ImGui::PopItemWidth();
+        ImGui::EndChild();
+
+        bool launch = false;
+        if (ImGui::Button(Gui::DesignText("开始练习", "Start Practice", "練習開始"))) {
+            if (sources.editor(game, &context, QuickPractice::Edit::Save, &mPracticeRequest)) {
+                mPracticeLaunch = PracticeLaunch { sources.service, mPracticeRequest };
+                launch = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(S(THPRAC_CANCEL))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return launch;
+    }
+
     void GameLaunchModal()
     {
         if (GuiModalFullScreen("Launch##@__launch_t")) {
@@ -2947,6 +3055,7 @@ public:
                 if (!mLaunchFailed) {
                     mLaunchAnm.Reset();
                     ImGui::CloseCurrentPopup();
+                    mPracticeLaunch.reset();
                     int action = 0;
                     LauncherSettingGet("after_launch", action);
                     switch (action) {
@@ -2974,13 +3083,18 @@ public:
                     mLaunchThread.Wait();
                     mLaunchThread.Stop();
                     mLaunchAbortInd = false;
+                    mPracticeLaunch.reset();
                     mLaunchAnm.Reset();
                     ImGui::CloseCurrentPopup();
                 }
             } else {
-                GuiCenteredText(S(THPRAC_GAMES_LAUNCH_ERR));
+                GuiCenteredText(mPracticeLaunch
+                    ? Gui::DesignText("未能进入所选练习。请检查游戏版本和插件。", "Could not enter the selected practice. Check the game version and plugins.",
+                          "選択した練習を開始できません。ゲームのバージョンとプラグインを確認してください。")
+                    : S(THPRAC_GAMES_LAUNCH_ERR));
                 if (GuiButtonTxtCentered(S(THPRAC_CLOSE), 0.8f)) {
                     mLaunchThread.Stop();
+                    mPracticeLaunch.reset();
                     mLaunchAnm.Reset();
                     ImGui::CloseCurrentPopup();
                 }
@@ -3221,9 +3335,17 @@ public:
 
         ImGui::EndChild();
 
+        const auto practice = PracticeSources();
+        const auto width = ImGui::GetContentRegionAvail().x;
         if (ImGui::Button(S(THPRAC_GAMES_LAUNCH_GAME),
-                ImVec2(ImGui::GetContentRegionAvail().x, launchHeight)))
+                ImVec2(practice ? (width - ImGui::GetStyle().ItemSpacing.x) * 0.5f : width, launchHeight)))
             GameLaunchModalOpen();
+        if (practice) {
+            ImGui::SameLine();
+            const bool open = ImGui::Button(PracticeTitle(), ImVec2(ImGui::GetContentRegionAvail().x, launchHeight));
+            if (open) ImGui::OpenPopup("##quick_practice");
+            if (DrawPracticeDialog(practice, open)) GameLaunchModalOpen();
+        }
         GameLaunchModal();
     }
 
@@ -3540,6 +3662,29 @@ public:
     {
         mGuiUpdFunc();
     }
+    std::wstring GameDirectory(const char* id) const
+    {
+        const auto found = mGames.find(id);
+        if (found == mGames.end()) return {};
+        const auto& game = found->second;
+        const auto directory = [id](const THGameInst& instance) -> std::wstring {
+            const std::filesystem::path exe = instance.type == TYPE_THCRAP
+                ? GetThcrapGamePath(id) : utf8_to_utf16(instance.path.c_str());
+            std::error_code error;
+            if (!exe.is_absolute() || !std::filesystem::is_regular_file(exe, error)) return {};
+            return exe.parent_path().wstring();
+        };
+        if (game.defaultLaunch >= 0 && static_cast<size_t>(game.defaultLaunch) < game.instances.size()) {
+            auto preferred = directory(game.instances[game.defaultLaunch]);
+            if (!preferred.empty()) return preferred;
+        }
+        for (const auto& instance : game.instances) {
+            auto folder = directory(instance);
+            if (!folder.empty()) return folder;
+        }
+        return {};
+    }
+
     std::vector<std::wstring> GetAllGamePaths()
     {
         std::vector<std::wstring> paths; 
@@ -3569,7 +3714,9 @@ private:
     GuiThread mLaunchThread { THGameGui::LaunchThreadFunc };
     float mLaunchModalTimeout = 0;
     bool mLaunchFailed = false;
-    bool mLaunchAbortInd = false;
+    std::atomic_bool mLaunchAbortInd = false;
+    std::optional<PracticeLaunch> mPracticeLaunch;
+    QuickPractice::Request mPracticeRequest;
     GuiWaitingAnm mLaunchAnm;
     bool mNeedRescan = false;
     THGame* mSelectedGameTmp = nullptr;
@@ -3647,5 +3794,10 @@ bool LauncherGamesThcrapLaunch()
 std::vector<std::wstring> GetAllGamePaths()
 {
     return THGameGui::singleton().GetAllGamePaths();
+}
+
+std::wstring LauncherGameDirectory(const char* id)
+{
+    return THGameGui::singleton().GameDirectory(id);
 }
 }

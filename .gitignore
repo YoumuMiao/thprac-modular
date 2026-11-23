@@ -263,14 +263,8 @@ paket-files/
 # Python Tools for Visual Studio (PTVS)
 __pycache__/
 *.pyc
-
-# Modular build and runtime data
-/build-win32/
-/.thprac_data/
-*.thp.dll
-*.thp.dll.disabled
+/covers/
+/extensions/launcher-layout/thprac/res/covers/
+/thprac/src/3rdParties/d3d8/
+/extensions/launcher-layout/thprac/src/3rdParties/d3d8/
 *.rpy
-
-# Vendored x86 object required by both CMake targets
-!/thprac/src/thprac/blobs/th19_fast_msvc.obj
-!/extensions/launcher-layout/thprac/src/thprac/blobs/th19_fast_msvc.obj

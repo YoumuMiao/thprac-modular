@@ -26,7 +26,7 @@
 
 #include "thprac_gui_impl_dx8.h"
 #include <imgui.h>
-#include "..\3rdParties\d3d8\include\d3d8.h"
+#include <legacy-dx8/d3d8.h>
 
 
 namespace THPrac

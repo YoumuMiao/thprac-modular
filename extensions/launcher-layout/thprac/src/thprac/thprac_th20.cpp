@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -868,7 +869,7 @@ namespace TH20 {
     // used for Nina Sp4 desync fix
     float defaultSpriteHeights[4] = { 0.0f, 6.0f, 10.0f, 14.0f };
 
-    struct THPracParam {
+    struct PracticeFields {
         int32_t mode;
         int32_t stage;
         int32_t section;
@@ -897,7 +898,10 @@ namespace TH20 {
         int32_t priorityY;
         int32_t levelG;
         int32_t priorityG;
+        bool dlg;
+    };
 
+    struct THPracParam : PracticeFields {
         int32_t reimuR2Timer[7];
         int32_t passiveMeterTimer[7];
         int32_t yellow2CycleAngle[7][4];
@@ -906,15 +910,11 @@ namespace TH20 {
         std::vector<PlayerDamageSource> rogueDmgSrcs[7];
         uint32_t nextDmgID[7];
         std::vector<uint32_t> expStoneColors[7];
-        bool dlg;
 
         bool _playLock = false;
         void Reset()
         {
-            for (size_t st = 0; st < elementsof(rogueDmgSrcs); ++st)
-                rogueDmgSrcs[st].clear();
-
-            memset(this, 0, sizeof(THPracParam));
+            *this = THPracParam {};
         }
         bool ReadJson(std::string& json)
         {
@@ -1144,21 +1144,32 @@ namespace TH20 {
         SINGLETON(THGuiPrac)
 
     public:
+
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mChapter, mScore, mLife, mLifeFragment,
+            mBomb, mBombFragment, mPower, mValue, mHyperActive,
+            mStoneActive, mHyper, mStone, mCycle, mLevelR,
+            mPriorityR, mLevelB, mPriorityB, mLevelY, mPriorityY,
+            mLevelG, mPriorityG)
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDifficulty = GetMemContent(RVA(DIFFICULTY));
+                mDifficulty = preview ? preview->difficulty : GetMemContent(RVA(DIFFICULTY));
                 SetFade(0.8f, 0.1f);
-                Open();
+                if (!QuickPractice::Active()) Open();
                 thPracParam.Reset();
             case 2:
                 break;
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (QuickPractice::UseParameters(static_cast<PracticeFields&>(thPracParam))) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -1468,6 +1479,8 @@ namespace TH20 {
 
         int mDifficulty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR_FIELDS(PracticeFields)
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -4072,7 +4085,7 @@ namespace TH20 {
         const auto manager = BossCaptureReadPointer(RVA(ENEMY_MGR_PTR));
         const auto files = manager ? BossCaptureReadPointer(manager+0x104) : 0;
         c.fileTable = files ? files+0xc : 0;
-        for (unsigned i=0;manager && i<8;++i) c.bosses[i] = BossCaptureReadPointer(manager+0x54+i*4);
+        BossCaptureReadBossHandles(20, manager, 0x54, 0x10c, 0x88, c.bosses);
         const auto spell = BossCaptureReadPointer(RVA(0x1ba578));
         c.survival = spell && (BossCaptureReadPointer(spell+0x78) & 8) != 0;
         c.spellCapturable = spell && (BossCaptureReadPointer(spell+0x78) & 2) != 0;
@@ -4568,8 +4581,13 @@ namespace TH20 {
         })
 
     // Capture settlements: the native HP/timeout condition has already succeeded.
-    EHOOK_ADDON_DY(th20_capture_config, 0xab080, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureEclArguments20(GetMemContent<uintptr_t>(pCtx->Ecx+8));
+    EHOOK_ADDON_DY(th20_capture_boss_config, 0x91d39, 2, (1u << static_cast<unsigned>(Addon::Capture)), {
+        const auto thread = BossCaptureReadPointer(pCtx->Ebp - 0x3f4);
+        BossCaptureConfigured(BossCaptureReadPointer(thread + 8), BossCaptureReadPointer(pCtx->Ebp - 0x3f8));
+    })
+    EHOOK_ADDON_DY(th20_capture_pattern_config, 0x93b74, 5, (1u << static_cast<unsigned>(Addon::Capture)), {
+        const auto thread = BossCaptureReadPointer(pCtx->Ebp - 0x3f4);
+        BossCaptureConfigured(BossCaptureReadPointer(thread + 8), BossCaptureReadPointer(pCtx->Ebp - 0x3f8));
     })
     HOOKSET_ENDDEF()
 
@@ -4629,6 +4647,7 @@ namespace TH20 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(20);
 
         TH20InGameInfo::singleton();
         TH20Save::singleton();

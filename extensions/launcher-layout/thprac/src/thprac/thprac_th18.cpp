@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -394,21 +395,30 @@ namespace TH18 {
             SetFade(0.8f, 0.1f);
             SetStyle(ImGuiStyleVar_WindowRounding, 0.0f);
             SetStyle(ImGuiStyleVar_WindowBorderSize, 0.0f);
-            SetViewport((void*)0x4cd420);
+            if (!QuickPractice::Preview()) SetViewport((void*)0x4cd420);
             OnLocaleChange();
         }
         SINGLETON(THGuiPrac)
 
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mChapter, mScore, mLife, mLifeFragment,
+            mBomb, mBombFragment, mPower, mFunds, mKozuchi,
+            mKaname, mMoon, mMikoflash, mVampire, mSun,
+            mLilyCount, mLilyCycle, mLilyCD, mBassdrum, mPsyco,
+            mCylinder, mRiceball, mMukade)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4c9ab0);
-                ToggleCards();
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4c9ab0);
+                if (!preview) ToggleCards();
 
                 SetFade(0.8f, 0.1f);
                 Open();
@@ -418,6 +428,8 @@ namespace TH18 {
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -737,6 +749,8 @@ namespace TH18 {
 
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
 
      struct LoadedReplayData {
         std::wstring originalName;
@@ -3647,7 +3661,7 @@ namespace TH18 {
         const auto manager = BossCaptureReadPointer(ENEMY_MANAGER_PTR);
         const auto files = manager ? BossCaptureReadPointer(manager+0x188) : 0;
         c.fileTable = files ? files+0xc : 0;
-        for (unsigned i=0;manager && i<8;++i) c.bosses[i] = BossCaptureReadPointer(manager+0x48+i*4);
+        BossCaptureReadBossHandles(18, manager, 0x48, 0x18c, 0x6830, c.bosses);
         const auto spell = BossCaptureReadPointer(0x4cf2c0);
         c.survival = spell && (BossCaptureReadPointer(spell+0x78) & 8) != 0;
         c.spellCapturable = spell && (BossCaptureReadPointer(spell+0x78) & 2) != 0;
@@ -4084,7 +4098,7 @@ namespace TH18 {
         GameGuiEnd(drawCursor);
     })
      EHOOK_DY(th18_render, 0x401510, 1, {
-        GameGuiRender(IMPL_WIN32_DX9);
+        if (!GameGuiUsesDx9OverlayScene()) GameGuiRender(IMPL_WIN32_DX9);
     })
     EHOOK_DY(th18_player_state, 0x45BE90,1,{
         if (g_adv_igi_options.show_keyboard_monitor)
@@ -4181,9 +4195,6 @@ namespace TH18 {
         if (static_cast<int32_t>(pCtx->Eax) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th18_capture_observe, 0x438aa0, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Ecx+0x5588));
-    })
     HOOKSET_ENDDEF()
 
     // Route reference (F10). The position pair offset inside the player object
@@ -4225,6 +4236,9 @@ namespace TH18 {
         GameGuiInit(IMPL_WIN32_DX9, 0x4ccdf8, WINDOW_PTR,
             Gui::INGAGME_INPUT_GEN2, 0x4ca21c, 0x4ca218, 0,
             -2, *(float*)0x56aca0, 0.0f);
+        // OILP redraws scenes between UI updates. Composite the cached UI once
+        // on each back-buffer scene, including every interpolated presentation.
+        GameGuiEnableDx9OverlayScene();
         SetDpadHook(0x4016EF, 3);
         // Gui components creation
         THGuiPrac::singleton();
@@ -4244,6 +4258,7 @@ namespace TH18 {
         VirtualProtect((void*)0x4b7ad8, 4, oldProtect, &oldProtect); 
 
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(18);
 
         // Reset thPracParam
 

@@ -7,7 +7,7 @@
 
 namespace THPrac {
 
-const char* th_glossary_str[3][1892] {
+const char* th_glossary_str[3][1906] {
     {
         "",
         "啤酒",
@@ -1901,6 +1901,20 @@ const char* th_glossary_str[3][1892] {
         "界面缩放:",
         "在系统 DPI 缩放的基础上进一步放大或缩小启动器界面（文字、控件与标题）。界面缩放越大，窗口可拖动到的上限也越大。修改后需重启启动器生效。",
         "重启启动器后生效",
+        "固定发弹角度",
+        "第 1 批角度（°）",
+        "第 2 批角度（°）",
+        "第 3 批角度（°）",
+        "影狼发弹角度",
+        "记录随机角度",
+        "每轮三批记为一组。每段最多记录 36 组，可以复制完整的组。",
+        "复制二非所选组",
+        "复制三非所选组",
+        "粘贴一组角度",
+        "清除已粘贴组",
+        "%u 组",
+        "请复制当前非符的一组角度（三批）。",
+        "组号",
     },
     {
         "",
@@ -3795,6 +3809,20 @@ const char* th_glossary_str[3][1892] {
         "UI scale:",
         "Scales the launcher UI (text, widgets and title) on top of the system DPI scaling. A larger scale also raises the maximum window size. Restart the launcher to apply.",
         "Restart the launcher to apply",
+        "Fixed firing angles",
+        "Volley 1 (deg)",
+        "Volley 2 (deg)",
+        "Volley 3 (deg)",
+        "Kagerou firing angles",
+        "Record random angles",
+        "Each cycle contains three volleys. Record up to 36 complete cycles per attack.",
+        "Copy selected cycle (NS2)",
+        "Copy selected cycle (NS3)",
+        "Paste one cycle",
+        "Clear pasted cycle",
+        "%u cycles",
+        "Copy one complete cycle (three volleys) from the selected nonspell.",
+        "Cycle",
     },
     {
         "",
@@ -5689,6 +5717,20 @@ const char* th_glossary_str[3][1892] {
         "UI スケール:",
         "システムの DPI スケーリングに加えて、ランチャーの UI（文字・ウィジェット・タイトル）を拡大したり小さくしたりします。大きくするとウィンドウの最大サイズも大きくなります。適用するにはランチャーを再起動してください。",
         "適用するにはランチャーを再起動してください",
+        "発射角度を固定",
+        "第1射の角度（度）",
+        "第2射の角度（度）",
+        "第3射の角度（度）",
+        "影狼の発射角度",
+        "ランダム角度を記録",
+        "3射を1周期として、各通常攻撃につき最大36周期を記録します。完了した周期をコピーできます。",
+        "通常2の選択した周期をコピー",
+        "通常3の選択した周期をコピー",
+        "1周期分の角度を貼り付け",
+        "貼り付けた周期を消去",
+        "%u 周期",
+        "選択中の通常攻撃から1周期分（3射）の角度をコピーしてください。",
+        "周期番号",
     },
 };
 

@@ -5,11 +5,10 @@
 #include "thprac_utils.h"
 
 #include <Windows.h>
-#include <objbase.h>
 #include <algorithm>
-#include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 // gdiplus.h calls min/max unqualified from inside its own namespace, so they
 // have to be reachable there when NOMINMAX is in effect.
@@ -38,8 +37,7 @@ namespace Gui {
             ImVec2 size {};
             ImU32 matte = 0; // average colour, used as the letterbox mat
             FILETIME stamp {};
-            bool haveStamp = false;
-            int origin = 0; // 0 = nothing, 1 = file on disk, 2 = embedded resource
+            std::wstring path;
             double nextCheck = 0.0;
         };
 
@@ -153,74 +151,6 @@ namespace Gui {
                 return nullptr;
             return UploadImage(source, outSize, outMatte);
         }
-
-        // Same, but for a cover embedded in the module's resources. GDI+ keeps a
-        // reference to the stream, so it has to outlive the bitmap.
-        void* DecodeToTexture(const void* bytes, size_t size, ImVec2& outSize, ImU32& outMatte)
-        {
-            if (!EnsureGdiplus() || !bytes || size == 0)
-                return nullptr;
-
-            HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE, size);
-            if (!global)
-                return nullptr;
-            if (void* buffer = GlobalLock(global)) {
-                memcpy(buffer, bytes, size);
-                GlobalUnlock(global);
-            } else {
-                GlobalFree(global);
-                return nullptr;
-            }
-
-            IStream* stream = nullptr;
-            if (FAILED(CreateStreamOnHGlobal(global, TRUE, &stream)) || !stream) {
-                GlobalFree(global);
-                return nullptr;
-            }
-            void* texture = nullptr;
-            Gdiplus::Bitmap source(stream, FALSE);
-            if (source.GetLastStatus() == Gdiplus::Ok)
-                texture = UploadImage(source, outSize, outMatte);
-            stream->Release();
-            return texture;
-        }
-
-        // The module that owns the cover resources is this one, not necessarily
-        // the process' main module (the same code also runs from the injected
-        // copy), so it is resolved from an address inside this translation unit.
-        HMODULE CoverModule()
-        {
-            static HMODULE module = nullptr;
-            if (!module) {
-                static const char anchor = 0;
-                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    (LPCWSTR)&anchor, &module);
-            }
-            return module;
-        }
-
-        // Resource names are COVER_<ID> ("COVER_TH06", "COVER_ALCOSTG", ...), as
-        // written by diagnosis/fetch_covers_thbwiki.py --rc.
-        bool FindEmbeddedCover(const std::wstring& gameId, const void*& bytes, DWORD& size)
-        {
-            HMODULE module = CoverModule();
-            if (!module)
-                return false;
-
-            std::wstring name = L"COVER_";
-            for (wchar_t ch : gameId)
-                name += (ch >= L'a' && ch <= L'z') ? (wchar_t)(ch - L'a' + L'A') : ch;
-
-            HRSRC resource = FindResourceW(module, name.c_str(), RT_RCDATA);
-            if (!resource)
-                return false;
-            HGLOBAL loaded = LoadResource(module, resource);
-            if (!loaded)
-                return false;
-            bytes = LockResource(loaded);
-            size = SizeofResource(module, resource);
-            return bytes != nullptr && size != 0;
-        }
     }
 
     const wchar_t* LauncherCoverFolder()
@@ -283,43 +213,22 @@ namespace Gui {
             const std::wstring wideId = utf8_to_utf16(gameId);
             std::wstring found;
             FILETIME stamp {};
-            const void* embedded = nullptr;
-            DWORD embeddedSize = 0;
-            int origin = 0;
-            if (FindCover(wideId, found, stamp)) {
-                origin = 1;
-            } else if (FindEmbeddedCover(wideId, embedded, embeddedSize)) {
-                origin = 2;
-            }
-
-            bool changed = origin != entry.origin;
-            if (!changed && origin == 1)
-                changed = !entry.haveStamp || CompareFileTime(&stamp, &entry.stamp) != 0;
-            if (!changed && origin == 2)
-                changed = entry.texture == nullptr;
-
-            if (changed) {
+            if (!FindCover(wideId, found, stamp)) {
+                LauncherReleaseTexture(entry.texture);
+                entry.texture = nullptr;
+                entry.matte = 0;
+                entry.path.clear();
+                entry.size = ImVec2(0.0f, 0.0f);
+            } else if (entry.path != found || CompareFileTime(&stamp, &entry.stamp) != 0) {
+                ImVec2 decodedSize;
                 ImU32 decodedMatte = 0;
-                void* decoded = nullptr;
-                if (origin == 1)
-                    decoded = DecodeToTexture(found, entry.size, decodedMatte);
-                else if (origin == 2)
-                    decoded = DecodeToTexture(embedded, embeddedSize, entry.size, decodedMatte);
-
-                if (decoded) {
+                if (void* decoded = DecodeToTexture(found, decodedSize, decodedMatte)) {
                     LauncherReleaseTexture(entry.texture);
                     entry.texture = decoded;
                     entry.matte = decodedMatte;
+                    entry.size = decodedSize;
                     entry.stamp = stamp;
-                    entry.haveStamp = origin == 1;
-                    entry.origin = origin;
-                } else if (origin == 0) {
-                    LauncherReleaseTexture(entry.texture);
-                    entry.texture = nullptr;
-                    entry.matte = 0;
-                    entry.haveStamp = false;
-                    entry.origin = 0;
-                    entry.size = ImVec2(0.0f, 0.0f);
+                    entry.path = std::move(found);
                 }
             }
         }
@@ -339,8 +248,7 @@ namespace Gui {
         for (auto& [id, entry] : g_covers) {
             LauncherReleaseTexture(entry.texture);
             entry.texture = nullptr;
-            entry.haveStamp = false;
-            entry.origin = 0;
+            entry.path.clear();
             entry.matte = 0;
             entry.nextCheck = 0.0;
         }

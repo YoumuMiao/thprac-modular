@@ -1,0 +1,6 @@
+{
+    "zh": "快速练习。在游戏详情页选择难度、机体与游戏内的练习跳转，启动后直接进入所选练习。需要启动器布局与游戏适配插件。",
+    "en": "Quick Practice. Choose difficulty, shot and the in-game practice options on the game details page, then launch straight into practice. Requires Launcher Layout and Game Adapter.",
+    "ja": "クイック練習。作品の詳細から難易度・機体・ゲーム内の練習オプションを選び、練習を直接開始します。ランチャーレイアウトとゲームアダプターが必要です。",
+    "settings": true
+}

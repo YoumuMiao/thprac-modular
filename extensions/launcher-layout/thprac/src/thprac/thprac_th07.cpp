@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_gui_impl_dx8.h"
@@ -152,17 +153,25 @@ namespace TH07 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mChapter, mFrame, mLife, mBomb,
+            mScore, mPower, mGraze, mPoint, mPointTotal,
+            mPointStage, mCherry, mCherryMax, mCherryPlus, mSpellBonus,
+            mRank, mRankLock)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             int oldRank = mDiffculty;
             switch (state) {
             case 0:
                 break;
             case 1:
                 SetFade(0.8f, 0.1f);
-                Open();
+                if (!QuickPractice::Active()) Open();
                 THReset();
-                mDiffculty = SUPERVISOR->config.last_selected_diff;
+                mDiffculty = preview ? preview->difficulty : SUPERVISOR->config.last_selected_diff;
                 if (mDiffculty != oldRank) {
                     if (mDiffculty == 0) {
                         mRank.SetBound(12, *mRankLock ? 99 : 20);
@@ -180,6 +189,8 @@ namespace TH07 {
             case 3:
                 SetFade(0.8f, 0.8f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -428,6 +439,8 @@ namespace TH07 {
         int mDiffculty = 0;
         bool isMarisaA = false;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -2426,6 +2439,7 @@ namespace TH07 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(7);
         EnableAllHooks(TH07Checksum);
         th07_rb.Setup();
         // Reset thPracParam

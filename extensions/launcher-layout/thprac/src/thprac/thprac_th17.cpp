@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -230,13 +231,21 @@ namespace TH17 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mKeepSpellDrops, mShowKeikiFinalOpt, mKeikiFinalP2Offset, mKeikiFinalP3Offset,
+            mKeikiFinalP4Offset, mChapter, mScore, mLife, mLifeFragment,
+            mBomb, mBombFragment, mGoast1, mGoast2, mGoast3,
+            mGoast4, mGoast5, mPower, mValue, mGraze)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDifficulty = *((int32_t*)0x4b2b28);
+                mDifficulty = preview ? preview->difficulty : *((int32_t*)0x4b2b28);
                 SetFade(0.8f, 0.1f);
                 Open();
                 thPracParam.Reset();
@@ -245,6 +254,8 @@ namespace TH17 {
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -617,6 +628,8 @@ namespace TH17 {
 
         int mDifficulty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep {
         THGuiRep() noexcept
         {
@@ -2545,7 +2558,7 @@ namespace TH17 {
         const auto manager = BossCaptureReadPointer(ENEMY_MANAGER_PTR);
         const auto files = manager ? BossCaptureReadPointer(manager+0x17c) : 0;
         c.fileTable = files ? files+0xc : 0;
-        for (unsigned i=0;manager && i<8;++i) c.bosses[i] = BossCaptureReadPointer(manager+0x48+i*4);
+        BossCaptureReadBossHandles(17, manager, 0x48, 0x180, 0x5760, c.bosses);
         const auto spell = BossCaptureReadPointer(0x4b7690);
         c.survival = spell && (BossCaptureReadPointer(spell+0x78) & 8) != 0;
         c.spellCapturable = spell && (BossCaptureReadPointer(spell+0x78) & 2) != 0;
@@ -2898,9 +2911,6 @@ namespace TH17 {
         if (static_cast<int32_t>(pCtx->Eax) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th17_capture_observe, 0x428cc0, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Ecx+0x44d8));
-    })
     HOOKSET_ENDDEF()
 
     // Route reference (F10). The position pair offset inside the player object
@@ -2959,6 +2969,7 @@ namespace TH17 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(17);
         th17_force_goast_angle.Setup();
 
          // Replay user menu (null) fix

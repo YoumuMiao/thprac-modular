@@ -1,5 +1,5 @@
 {
-  "zh": "统计符卡和非符的尝试、收取与超时次数，并保存跨次运行的记录。",
-  "en": "Tracks spell and nonspell attempts, captures, and timeouts across sessions.",
-  "ja": "スペルカードと通常攻撃の挑戦、取得、時間切れをセッションをまたいで記録します。"
+  "zh": "统计符卡和非符的尝试、收取与超时次数，并保存跨次运行的记录；TH06–08、TH10–14、TH16–18、TH20 均按游戏原生符卡结算前后的记录和成功事件判定收取。TH15 由专项插件提供。",
+  "en": "Tracks spell and nonspell attempts, captures, and timeouts across sessions. TH06–08, TH10–14, TH16–18 and TH20 use native before/after spell records and successful capture events. TH15 uses its dedicated plugin.",
+  "ja": "スペルカードと通常攻撃の挑戦、取得、時間切れを記録します。TH06–08、TH10–14、TH16–18、TH20 はゲーム本来の終了前後の記録と取得成功イベントで判定します。TH15 は専用プラグインが担当します。"
 }

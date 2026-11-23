@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -136,14 +137,21 @@ namespace TH13 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSpiritSide, mSection,
+            mPhase, mDlg, mUseOD, mChapter, mScore,
+            mLife, mExtend, mLifeFragment, mBomb, mBombFragment,
+            mPower, mTranceMeter, mValue, mGraze)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4be7c4);
-                if (mDiffculty == 5)
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4be7c4);
+                if (!preview && mDiffculty == 5)
                     *((int32_t*)0x4be7c4) = mDiffculty = (*mStage == 7) ? 4:3;
                 SetFade(0.8f, 0.1f);
                 Open();
@@ -153,6 +161,8 @@ namespace TH13 {
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -258,8 +268,11 @@ namespace TH13 {
 
                 Gui::PracticeSection(true);
                 mLife();
-                if (mExtend())
-                    mLifeFragment.SetBound(0, ((int*)0x4bb994)[*mExtend] - 1);
+                if (mExtend()) {
+                    constexpr int lifePieces[] = { 8, 10, 12, 15, 18, 20, 25 };
+                    const auto* limits = QuickPractice::Preview() ? lifePieces : reinterpret_cast<const int*>(0x4bb994);
+                    mLifeFragment.SetBound(0, limits[*mExtend] - 1);
+                }
                 mLifeFragment();
                 mBomb();
                 mBombFragment();
@@ -419,6 +432,8 @@ namespace TH13 {
 
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -2338,9 +2353,6 @@ namespace TH13 {
         if (static_cast<int32_t>(pCtx->Eax) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th13_capture_observe, 0x421b10, 6, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Eax+0x40c8));
-    })
     HOOKSET_ENDDEF()
     // Route reference (F10). Ten Desires stores the centred player position at
     // 0x5B8 inside the player object; the same pair feeds the in-game hitbox
@@ -2389,6 +2401,7 @@ namespace TH13 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(13);
 
         // Reset thPracParam
         thPracParam.Reset();

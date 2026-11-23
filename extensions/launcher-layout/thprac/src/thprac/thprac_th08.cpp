@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_gui_impl_dx8.h"
@@ -446,8 +447,17 @@ namespace TH08 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mDropPoints, mBossX, mBossY, mChapter,
+            mFrame, mLife, mBomb, mPower, mGauge,
+            mScore, mGraze, mPoint, mPointTotal, mPointStage,
+            mTime, mValue, mFamiliar, mNight, mRank,
+            mRankLock)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             int gaugeType = 0;
             switch (state) {
             case 0:
@@ -455,8 +465,8 @@ namespace TH08 {
             case 1:
                 SetFade(0.8f, 0.1f);
                 Open();
-                mDiffculty = (int)(*((int8_t*)0x17ce891));
-                switch (*((int8_t*)0x164d0b1)) {
+                mDiffculty = preview ? preview->difficulty : (int)(*((int8_t*)0x17ce891));
+                switch (preview ? preview->shot : *((int8_t*)0x164d0b1)) {
                 case 2: // scarlet team
                     mGauge.SetBound(-10000, 10000);
                     gaugeType = -1;
@@ -511,6 +521,8 @@ namespace TH08 {
             case 3:
                 SetFade(0.8f, 0.8f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -830,6 +842,8 @@ namespace TH08 {
         int mGaugeType;
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -3459,7 +3473,7 @@ namespace TH08 {
         TH08InGameInfo::singleton().mDesolveCount = 0;
     })
     EHOOK_DY(th08_spell_capture, 0x416265, 3, { // to enable SC count in rep, do not directly read spell capture array
-        BossCaptureSpellCaptured(BossCaptureReadPointer(pCtx->Eax + 4));
+        BossCaptureNativeSpellSucceeded();
         const static int32_t last_spells[] = {
             10, 11, 12,
             29, 30, 31,
@@ -3496,6 +3510,7 @@ namespace TH08 {
         g_lock_timer = 0;
     })
     EHOOK_DY(th08_lock_timer2, 0x41CB32,2,{ // set timeout case 132
+        BossCaptureConfigured(BossCaptureReadPointer(pCtx->Ebp+8), BossCaptureReadPointer(pCtx->Ebp-0xc));
         g_lock_timer = 0;
     })
     EHOOK_DY(th08_lock_timer3, 0x41C44F, 2, {
@@ -3514,11 +3529,12 @@ namespace TH08 {
         BossCaptureCleared(BossCaptureReadPointer(pCtx->Ebp-0x18), true);
     })
     // The timer setter is shared. Admit only the ECL interpreter callers and
-    // recover the exact instruction before configuring a canonical attack.
-    EHOOK_ADDON_DY(th08_capture_config, 0x4065f0, 1, (1u << static_cast<unsigned>(Addon::Capture)), {
-        const auto caller = BossCaptureReadPointer(pCtx->Esp);
-        if (caller >= 0x410000 && caller < 0x41e800)
-            BossCaptureConfigured(pCtx->Ecx-0x2e14, BossCaptureReadPointer(pCtx->Ebp-0xc));
+    // Configure only at native spell/phase opcodes, not the shared argument reader.
+    EHOOK_ADDON_DY(th08_capture_spell_config, 0x41cb06, 3, (1u << static_cast<unsigned>(Addon::Capture)), {
+        BossCaptureConfigured(BossCaptureReadPointer(pCtx->Ebp+8), BossCaptureReadPointer(pCtx->Ebp-0xc));
+    })
+    EHOOK_ADDON_DY(th08_capture_pattern_config, 0x41ccfc, 6, (1u << static_cast<unsigned>(Addon::Capture)), {
+        BossCaptureConfigured(BossCaptureReadPointer(pCtx->Ebp+8), BossCaptureReadPointer(pCtx->Ebp-0xc));
     })
     HOOKSET_ENDDEF()
 
@@ -3594,6 +3610,7 @@ namespace TH08 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(8);
         EnableAllHooks(TH08Checksum);
         th08_name_fix.Setup();
         // Reset thPracParam

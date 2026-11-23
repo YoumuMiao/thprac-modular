@@ -27,4 +27,5 @@ void LauncherGamesThcrapCfgGet(std::vector<std::pair<std::string, bool>>& cfgVec
 void LauncherGamesThcrapAdd(const char* gameId, const std::string& cfg, bool use_thprac, bool flush = false);
 bool LauncherGamesThcrapLaunch();
 std::vector<std::wstring> GetAllGamePaths();
+std::wstring LauncherGameDirectory(const char* id);
 }

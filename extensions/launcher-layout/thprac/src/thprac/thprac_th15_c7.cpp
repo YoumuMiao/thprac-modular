@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -144,13 +145,20 @@ namespace TH15Stock {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mDoremyNormal1Phase, mEnhanced_para, mChapter, mScore,
+            mLife, mLifeFragment, mBomb, mBombFragment, mPower,
+            mValue, mGraze, mReisenShield)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4e7410);
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4e7410);
                 SetFade(0.8f, 0.1f);
                 Open();
                 thPracParam.Reset();
@@ -159,6 +167,8 @@ namespace TH15Stock {
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -178,7 +188,7 @@ namespace TH15Stock {
                 thPracParam.power = *mPower;
                 thPracParam.value = *mValue;
                 thPracParam.graze = *mGraze;
-                if (GetMemContent(CHARACTER) == 3)
+                if (IsReisen())
                     thPracParam.reisen_shield = *mReisenShield;
                 break;
             case 4:
@@ -191,6 +201,12 @@ namespace TH15Stock {
         }
 
     protected:
+        static bool IsReisen()
+        {
+            const auto* preview = QuickPractice::Preview();
+            return (preview ? preview->shot : GetMemContent<int>(CHARACTER)) == 3;
+        }
+
         virtual void OnLocaleChange() override
         {
             SetTitle(S(TH_MENU));
@@ -307,7 +323,7 @@ namespace TH15Stock {
                 mScore();
                 mScore.RoundDown(10);
 
-                if (GetMemContent(CHARACTER) == 3)
+                if (IsReisen())
                     mReisenShield();
             }
 
@@ -443,6 +459,8 @@ namespace TH15Stock {
 
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {

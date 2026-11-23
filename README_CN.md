@@ -1,8 +1,9 @@
-# 上游 thprac 用法参考
+## [C7 插件版使用及构建说明](README.md)
 
-插件版的使用、构建与开发方式见 [项目主页](README.md)。
+以下保留上游 thprac 的通用练习功能说明。
+# thprac
 一个东方Project弹幕射击游戏练习器（既是练习器，又是游戏启动器！）
-## [下载](https://github.com/touhouworldcup/thprac/releases/latest)
+## [C7 插件版下载](https://github.com/YoumuMiao/thprac-modular/releases)
 
 # 如何使用
 Either: 把可执行文件放在和游戏相同的文件夹中，然后运行。游戏必须更新到最新版本并且保留其原本的文件名 (大多游戏为 thXX.exe，东方红魔乡为 東方紅魔郷.exe，黄昏酒场为 alcostg.exe)。Thprac 会自动检测 vpatch。 Steam 版本不适用此方法.
@@ -14,13 +15,9 @@ Or: 使用自带游戏启动器。这个视频交代了如何使用（需要科�
 
 # 功能
 ## 增强练习模式 (支持所有主要游戏，包括妖精大战争和黄昏酒场。不支持花映塚)
-![东方虹龙洞](https://user-images.githubusercontent.com/23106652/174433923-0a6069e7-d10d-4107-8f0d-f4a8a9d56976.png)
-![grafik](https://user-images.githubusercontent.com/23106652/174433975-8f23b0b0-e48e-4be1-8cb7-d8e3e7ab6b8e.png)
 
 使用这个UI替换了原版练习菜单。另外在妖精大战争和黄昏酒场（没有练习模式）的开始游戏（"Start Game"）界面添加了练习菜单。您可以选择符卡和符卡阶段或者修改某些参数。
 
-![Uwabami Breakers](https://user-images.githubusercontent.com/23106652/174434103-5fee7a13-0254-4602-a468-42330b985bb2.png)
-![Great Fairy Wars](https://user-images.githubusercontent.com/23106652/174434121-063142f2-ef3d-4721-ab96-a252343cdb0e.png)
 
 您可以用键盘或手柄控制练习菜单。在此菜单中，可以用 UP 或DOWN 选择选项，并用 LEFT 或 RIGHT 更改选项。您也可以用鼠标操作菜单。最后按下 SHOT 确认.
 
@@ -29,26 +26,19 @@ Thprac 会自动将您输入的选项保存到 replay 中，播放 replay 时，
 ## 退格键(Backspace)菜单
 在任何支持的游戏中 (除了 TH09) 你可以按下 BACKSPACE 来显示 “退格键菜单”。菜单显示了可以使用 F 功能键激活的选项。
 
-![TH18](https://user-images.githubusercontent.com/23106652/174434813-73748a66-0f6d-4c6e-9f3a-895a49b93434.png)
-![TH17](https://user-images.githubusercontent.com/23106652/174434834-6bd93104-1ed2-48ae-a440-9d9cb871ea03.png)
 
 ## 高级选项
 在任何支持的游戏中，你可以按下 F12 来打开高级选项。
-![TH08](https://user-images.githubusercontent.com/23106652/174434977-683da583-324b-4bd5-8408-13373dfd5a93.png)
-![TH18](https://user-images.githubusercontent.com/23106652/174435006-e906d30d-0ef5-4930-ae57-1f0919beb5af.png)
 
 ## 统计 (神灵庙)
 在 TH13 中，按下 L 可显示更高级的 HUD
-![TH13](https://user-images.githubusercontent.com/23106652/174435095-51554934-83d3-4d05-847d-834f3068bc28.png)
 
 ## 游戏特定功能
 ### TH09 工具 (花映塚专用)
-![TH09 Tools](https://user-images.githubusercontent.com/23106652/174434249-2bf1d70a-101c-4538-a4e6-8eeaf273dd88.png) 
 
 在对战模式开启游戏时，你可以在“模式”选项中选择“自定义”。如果这么做，这个窗口会出现在游戏中。它可以根据需要移动和调整窗口大小，并且可以按 F11 完全隐藏。
 
 ### TH06 暂停菜单
-![TH06](https://user-images.githubusercontent.com/23106652/174436027-734d642a-300c-45ab-9591-b6219aca087b.png)
 选择“退出游戏”时将提示您保存repaly。警告：这样保存的 replay 在您选择保存的时间点后还会继续播放。在此之后自机会停止不动并且停止射击。
 
 ### 为天空璋、鬼形兽、虹龙洞修复 ESC + R 重开快捷键
@@ -60,10 +50,9 @@ Thprac 会自动将您输入的选项保存到 replay 中，播放 replay 时，
 - 将所有report从 [旧的bugtracker](https://github.com/ack7139/thprac/issues) 移到 [此处](https://github.com/touhouworldcup/thprac/issues): [toimine](https://www.youtube.com/channel/UCtxu8Rg0Vh8mX6iENenetuA)
 - 中文README翻译：[TNT569](https://github.com/TNT569) (翻译可能存在不足，敬请改正)
 
-# 如何构建:
-捆绑了一个 Visual Studio 解决方案，该解决方案使用 Visual Studio 2022 build tools (v143) 进行构建。但是，thprac 也可以使用 Visual Studio 2019 build tools (v142) 完美编译。您的构建将完全支持 Windows XP，而不需要 v141_xp build tools。
+# 如何构建
 
-如果您想在本地代码仓库中添加新的字符串，请将其放入thprac_games_def.json 并使用 [thprac devtools](https://github.com/touhouworldcup/thprac_utils) 来生成新的 thrac_locale_def.h
+请参阅 [C7 插件版构建说明](README.md#构建)。
 
 # Q&A
 

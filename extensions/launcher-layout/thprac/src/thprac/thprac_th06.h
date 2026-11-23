@@ -3,7 +3,7 @@
 #include "thprac_games.h"
 #include <stdint.h>
 
-#include "../3rdParties/d3d8/include/d3d8.h"
+#include <legacy-dx8/d3d8.h>
 struct Matrix44 {
     float dat[4][4];
 };

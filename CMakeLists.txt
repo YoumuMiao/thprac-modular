@@ -17,6 +17,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(vendor "${PROJECT_SOURCE_DIR}/thprac/src/3rdParties")
 set(prac "${PROJECT_SOURCE_DIR}/thprac/src/thprac")
 
+set(THPRAC_DX8_SDK "$ENV{THPRAC_DX8_SDK}" CACHE PATH "DirectX 8 SDK directory")
+set(legacy_headers "${CMAKE_BINARY_DIR}/legacy-headers")
+foreach(header IN ITEMS d3d8.h d3d8caps.h d3d8types.h dsound.h)
+    if(NOT EXISTS "${THPRAC_DX8_SDK}/include/${header}")
+        message(FATAL_ERROR "Set THPRAC_DX8_SDK to a local DirectX 8 SDK directory containing include/${header}.")
+    endif()
+    configure_file("${THPRAC_DX8_SDK}/include/${header}" "${legacy_headers}/legacy-dx8/${header}" COPYONLY)
+endforeach()
+
 function(thprac_native target)
     target_compile_definitions(${target} PRIVATE WIN32 UNICODE _UNICODE WINVER=0x0601 _WIN32_WINNT=0x0601
         _CRT_SECURE_NO_WARNINGS)
@@ -27,14 +36,14 @@ function(thprac_native target)
 endfunction()
 
 include(sources.cmake)
-add_library(thprac_common STATIC ${THPRAC_C7_SOURCES})
+add_library(thprac_common STATIC ${THPRAC_C7_SOURCES} "${prac}/thprac_dx8_image.cpp")
 thprac_native(thprac_common)
 target_link_libraries(thprac_common PUBLIC
     kernel32 ntdll user32 freetype gdi32 gdiplus dxguid d3d9 xinput winmm dinput8 ws2_32
     wininet Shlwapi ole32 comdlg32 shell32 advapi32 delayimp dsound)
 target_link_directories(thprac_common PUBLIC
-    "${vendor}/FreeType/win32" "${vendor}/d3d8/lib" "${vendor}/d3d9/lib" "${vendor}/minizip/lib")
-target_include_directories(thprac_common PUBLIC "${PROJECT_SOURCE_DIR}/thprac"
+    "${vendor}/FreeType/win32" "${vendor}/minizip/lib")
+target_include_directories(thprac_common PUBLIC "${PROJECT_SOURCE_DIR}/thprac" "${legacy_headers}"
     "${vendor}/rapidjson/include" "${vendor}/MetroHash" "${vendor}/distorm/include"
     "${vendor}/ImGui" "${vendor}/FreeType/include" "${vendor}/MinHook/include")
 target_compile_definitions(thprac_common PUBLIC HAVE_SSE2 DISTORM_LIGHT _WINDOWS MS_TOOLSET_VERSION=${MSVC_TOOLSET_VERSION})
@@ -111,4 +120,29 @@ if(BUILD_TESTING)
     target_include_directories(stage_tracker_contract PRIVATE "${prac}" "${PROJECT_SOURCE_DIR}/sdk")
     set_target_properties(stage_tracker_contract PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test-bin")
     add_test(NAME stage_tracker_contract COMMAND stage_tracker_contract)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(game_bgm_contract test/modular/game_bgm_contract.cpp)
+    thprac_native(game_bgm_contract)
+    target_include_directories(game_bgm_contract PRIVATE sdk)
+    target_link_libraries(game_bgm_contract PRIVATE winmm)
+    set_target_properties(game_bgm_contract PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test-bin/bgm-fixture")
+    add_dependencies(game_bgm_contract game_bgm)
+    add_test(NAME game_bgm_contract COMMAND game_bgm_contract
+        "$<TARGET_FILE_DIR:thprac>/plugins/game/$<TARGET_FILE_NAME:game_bgm>")
+endif()
+
+if(BUILD_TESTING)
+    add_executable(quick_practice_contract test/modular/quick_practice_contract.cpp)
+    thprac_native(quick_practice_contract)
+    target_include_directories(quick_practice_contract PRIVATE extensions/quick-practice)
+    target_link_libraries(quick_practice_contract PRIVATE thprac_layout_support)
+    set_target_properties(quick_practice_contract PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test-bin")
+    add_dependencies(quick_practice_contract quick_practice game_adapter th15_practice)
+    add_test(NAME quick_practice_contract COMMAND quick_practice_contract
+        "$<TARGET_FILE_DIR:thprac>/plugins/shared/$<TARGET_FILE_NAME:quick_practice>"
+        "$<TARGET_FILE_DIR:thprac>/plugins/game/$<TARGET_FILE_NAME:game_adapter>"
+        "$<TARGET_FILE_DIR:thprac>/plugins/game/$<TARGET_FILE_NAME:th15_practice>")
 endif()

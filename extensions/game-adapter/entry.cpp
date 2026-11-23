@@ -4,6 +4,7 @@
 #undef TH15Init
 #include "thprac_hook.h"
 #include "feature_runtime.h"
+#include "quick_practice_adapter.h"
 #include <cstring>
 
 namespace {
@@ -12,16 +13,18 @@ int __cdecl Start(const ThpracGameHost* host, const char* gameId)
     using namespace THPrac;
     if (!host || host->size < offsetof(ThpracGameHost, dispatch_plugin_event)) return 0;
     ConfigureAddons(*host, gameId);
-    if (!AddonEnabled(Addon::Capture) && !AddonEnabled(Addon::Route) && !AddonEnabled(Addon::Volume)
-        && !AddonEnabled(Addon::Settings) && !AddonEnabled(Addon::Repairs) && !AddonEnabled(Addon::Th15))
-        return 0;
     // Keep the exact executable match, including both TH19 builds.
     for (const auto& game : gGameDefs) {
         if (game.initFunc && std::strcmp(game.idStr, gameId) == 0
             && game.exeSig.timeStamp == host->exe_timestamp && game.exeSig.textSize == host->exe_text_size) {
             if (std::strcmp(gameId, "th15") == 0 && AddonEnabled(Addon::Th15)) return 0;
+            const bool quickPractice = QuickPractice::Claim(*host, gameId);
+            if (!quickPractice && !AddonEnabled(Addon::Capture) && !AddonEnabled(Addon::Route) && !AddonEnabled(Addon::Volume)
+                && !AddonEnabled(Addon::Settings) && !AddonEnabled(Addon::Repairs) && !AddonEnabled(Addon::Th15))
+                return 0;
             VEHHookInit();
             game.initFunc();
+            QuickPractice::Install();
             return 1;
         }
     }

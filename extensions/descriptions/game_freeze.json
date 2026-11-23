@@ -1,0 +1,6 @@
+{
+  "zh": "按 P 冻结游戏画面和进度，再按一次恢复。冻结时每按一次 L 推进一帧。不会弹出原版暂停菜单。可在下方更改冻结键。",
+  "en": "Press P to freeze the current frame and game progress. Press L while frozen to step one frame, or P to resume. The native pause menu stays closed. Change the freeze key below.",
+  "ja": "P キーで画面とゲーム進行を停止し、もう一度押すと再開します。停止中は L キーで 1 フレームずつ進みます。ポーズメニューは表示されません。下の設定で停止キーを変更できます。",
+  "settings": true
+}

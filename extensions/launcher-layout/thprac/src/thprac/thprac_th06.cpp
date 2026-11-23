@@ -1,14 +1,16 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_gui_impl_dx8.h"
 #include "thprac_games_dx8.h"
 
 #include "thprac_utils.h"
-#include "../3rdParties/d3d8/include/d3d8.h"
+#include <legacy-dx8/d3d8.h>
 #include <fstream>
 
 #include <format>
-#include "../3rdParties/d3d8/include/dsound.h"
+#include <span>
+#include <legacy-dx8/dsound.h>
 
 
 #include "thprac_res.h"
@@ -46,6 +48,7 @@ namespace TH06 {
     // events into the THP database.
     static void Th06CaptureBegin(int32_t spellId, int8_t diff, byte playerType)
     {
+        if (BossCapture::NativeBridgeActive()) return;
         BossCapture::Context context;
         context.game = 6;
         context.difficulty = diff;
@@ -400,6 +403,16 @@ namespace TH06 {
 
     THPracParam thPracParam {};
 
+    struct TH06QuickPracticeState {
+        THPracParam parameters;
+        int difficulty;
+        int shot;
+        int warp;
+        int sectionIndex;
+        int chapter;
+        int fakeShot;
+    };
+
     class THOverlay : public Gui::GameGuiWnd {
         THOverlay() noexcept
         {
@@ -551,16 +564,27 @@ namespace TH06 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mChapter, mFrame, mLife, mBomb,
+            mScore, mPower, mGraze, mPoint, mDelaySt6Bs9,
+            mWallPrac, mBookX1, mBookY1, mBookX2, mBookY2,
+            mBookX3, mBookY3, mBookX4, mBookY4, mBookX5,
+            mBookY5, mBookX6, mBookY6, mWallPracSnipeF, mWallPracSnipeN,
+            mBookC1, mBookC2, mBookC3, mBookC4, mBookC5,
+            mBookC6, mRank, mRankLock, mFakeShot)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
                 SetFade(0.8f, 0.1f);
                 Open();
-                mDiffculty = (int)(*((int8_t*)0x69bcb0));
-                mShotType = (int)(*((int8_t*)0x69d4bd) * 2) + *((int8_t*)0x69d4be);
+                mDiffculty = preview ? preview->difficulty : (int)(*((int8_t*)0x69bcb0));
+                mShotType = preview ? preview->shot : (int)(*((int8_t*)0x69d4bd) * 2) + *((int8_t*)0x69d4be);
                 break;
             case 2:
                 break;
@@ -569,49 +593,8 @@ namespace TH06 {
                 Close();
                 *mNavFocus = 0;
 
-                // Fill Param
-                thPracParam.mode = *mMode;
-
-                thPracParam.stage = *mStage;
-                thPracParam.section = CalcSection();
-                thPracParam.phase = *mPhase;
-                thPracParam.frame = *mFrame;
-                if (SectionHasDlg(thPracParam.section))
-                    thPracParam.dlg = *mDlg;
-                if (thPracParam.section == TH06_ST6_BOSS9)
-                    thPracParam.delay_st6bs9 = *mDelaySt6Bs9;
-                if (thPracParam.section == TH06_ST6_BOSS9 || thPracParam.section == TH06_ST6_BOSS6)
-                {
-                    thPracParam.wall_prac_st6 = *mWallPrac;
-                    thPracParam.snipeF = *mWallPracSnipeF;
-                    thPracParam.snipeN = *mWallPracSnipeN;
-                }
-                if (thPracParam.section == TH06_ST4_BOOKS) {
-                    thPracParam.bF = 0;
-                    thPracParam.bF |= ((int)*mBookC1)<<0;thPracParam.bX1 = *mBookX1;thPracParam.bY1 = *mBookY1;
-                    thPracParam.bF |= ((int)*mBookC2)<<1;thPracParam.bX2 = *mBookX2;thPracParam.bY2 = *mBookY2;
-                    thPracParam.bF |= ((int)*mBookC3)<<2;thPracParam.bX3 = *mBookX3;thPracParam.bY3 = *mBookY3;
-                    thPracParam.bF |= ((int)*mBookC4)<<3;thPracParam.bX4 = *mBookX4;thPracParam.bY4 = *mBookY4;
-                    thPracParam.bF |= ((int)*mBookC5)<<4;thPracParam.bX5 = *mBookX5;thPracParam.bY5 = *mBookY5;
-                    thPracParam.bF |= ((int)*mBookC6)<<5;thPracParam.bX6 = *mBookX6;thPracParam.bY6 = *mBookY6;
-                }
-
-                thPracParam.score = *mScore;
-                thPracParam.life = (float)*mLife;
-                thPracParam.bomb = (float)*mBomb;
-                thPracParam.power = (float)*mPower;
-                thPracParam.graze = *mGraze;
-                thPracParam.point = *mPoint;
-
-                thPracParam.rank = *mRank;
-                thPracParam.rankLock = *mRankLock;
-                if (thPracParam.section >= TH06_ST4_BOSS1 && thPracParam.section <= TH06_ST4_BOSS7)
-                    thPracParam.fakeType = *mFakeShot;
-                break;
-            case 4:
-                Close();
-                *mNavFocus = 0;
-                break;
+                if (LoadQuickPractice()) break;
+                [[fallthrough]];
             case 5:
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -650,9 +633,26 @@ namespace TH06 {
                 if (thPracParam.section >= TH06_ST4_BOSS1 && thPracParam.section <= TH06_ST4_BOSS7)
                     thPracParam.fakeType = *mFakeShot;
                 break;
+            case 4:
+                Close();
+                *mNavFocus = 0;
+                break;
             default:
                 break;
             }
+        }
+
+        void SaveQuickPractice(QuickPractice::Request& request)
+        {
+            thPracParam.Reset();
+            State(3);
+            const TH06QuickPracticeState selection {
+                thPracParam, mDiffculty, mShotType, *mWarp, *mSection, *mChapter, *mFakeShot
+            };
+            static_assert(sizeof(selection) <= sizeof(request.parameters));
+            request.stage = selection.parameters.stage;
+            request.bytes = sizeof(selection);
+            std::memcpy(request.parameters, &selection, sizeof(selection));
         }
 
         void SpellPhase()
@@ -815,6 +815,107 @@ namespace TH06 {
         }
 
     protected:
+        static void RestoreLegacyWarp(TH06QuickPracticeState& selection, int stage)
+        {
+            const auto& params = selection.parameters;
+            if (!params.section) {
+                selection.warp = params.frame ? 6 : 0;
+                return;
+            }
+            if (params.section >= 10000) {
+                selection.warp = 1;
+                selection.chapter = params.section - 10000 - (stage + 1) * 100;
+                return;
+            }
+
+            // The old editor stored the section ID alone. Look it up using
+            // the same tables as CalcSection so a retry writes back that ID.
+            const std::span<const th_sections_t> sections[] {
+                th_sections_cba[stage][0], th_sections_cba[stage][1],
+                th_sections_cbt[stage][0], th_sections_cbt[stage][1],
+            };
+            for (int index = 0; index < std::size(sections); ++index) {
+                const auto entries = sections[index];
+                const auto match = std::find(entries.begin(), entries.end(), params.section);
+                if (match == entries.end()) continue;
+                selection.warp = index + 2;
+                selection.sectionIndex = static_cast<int>(match - entries.begin());
+                return;
+            }
+        }
+
+        bool LoadQuickPractice()
+        {
+            const auto* request = QuickPractice::PendingParameters();
+            if (!request) return false;
+
+            TH06QuickPracticeState selection {};
+            if (request->bytes == sizeof(selection.parameters)) {
+                if (!QuickPractice::UseParameters(selection.parameters)) return false;
+                selection.difficulty = request->difficulty;
+                selection.shot = request->shot;
+                selection.fakeShot = selection.parameters.fakeType;
+                RestoreLegacyWarp(selection, request->stage);
+            } else if (!QuickPractice::UseParameters(selection)) {
+                return false;
+            }
+
+            // The pause menu reads these controls again on retry.
+            const auto& params = selection.parameters;
+            mDiffculty = selection.difficulty;
+            mShotType = selection.shot;
+            // Keep the selected main-game difficulty when the pause menu leaves Extra.
+            *reinterpret_cast<int8_t*>(0x6c6e49) = static_cast<int8_t>(selection.difficulty);
+            *mMode = params.mode;
+            *mStage = params.stage;
+            *mWarp = selection.warp;
+            *mSection = selection.sectionIndex;
+            *mChapter = selection.chapter;
+            *mFakeShot = selection.fakeShot;
+            *mPhase = params.phase;
+            *mFrame = params.frame;
+            *mDlg = params.dlg;
+            *mScore = params.score;
+            *mLife = static_cast<int>(params.life);
+            *mBomb = static_cast<int>(params.bomb);
+            *mPower = static_cast<int>(params.power);
+            *mGraze = params.graze;
+            *mPoint = params.point;
+            *mRankLock = params.rankLock;
+            mRank.SetBound(0, params.rankLock ? 99 : 32);
+            *mRank = params.rank;
+
+            if (params.section == TH06_ST6_BOSS9)
+                *mDelaySt6Bs9 = params.delay_st6bs9;
+            if (params.section == TH06_ST6_BOSS9 || params.section == TH06_ST6_BOSS6) {
+                *mWallPrac = params.wall_prac_st6;
+                *mWallPracSnipeF = params.snipeF;
+                *mWallPracSnipeN = params.snipeN;
+            }
+            if (params.section == TH06_ST4_BOOKS) {
+                struct BookControls {
+                    bool& enabled;
+                    int& x;
+                    int& y;
+                };
+                const BookControls books[] = {
+                    { *mBookC1, *mBookX1, *mBookY1 }, { *mBookC2, *mBookX2, *mBookY2 },
+                    { *mBookC3, *mBookX3, *mBookY3 }, { *mBookC4, *mBookX4, *mBookY4 },
+                    { *mBookC5, *mBookX5, *mBookY5 }, { *mBookC6, *mBookX6, *mBookY6 }
+                };
+                const int x[] = { params.bX1, params.bX2, params.bX3, params.bX4, params.bX5, params.bX6 };
+                const int y[] = { params.bY1, params.bY2, params.bY3, params.bY4, params.bY5, params.bY6 };
+                for (size_t i = 0; i < std::size(books); ++i) {
+                    books[i].enabled = (params.bF & (1u << i)) != 0;
+                    books[i].x = x[i];
+                    books[i].y = y[i];
+                }
+            }
+
+            thPracParam = params;
+            return true;
+        }
+
         virtual void OnLocaleChange() override
         {
             SetTitle(S(TH_MENU));
@@ -1010,6 +1111,15 @@ namespace TH06 {
         int mDiffculty = 0;
         int mShotType = 0;
     };
+
+    int EditQuickPractice(QuickPractice::Edit action, QuickPractice::Request& request)
+    {
+        auto& menu = THGuiPrac::singleton();
+        if (action != QuickPractice::Edit::Save)
+            return QuickPractice::EditMenu<THPracParam>(menu, thPracParam, action, request);
+        menu.SaveQuickPractice(request);
+        return 1;
+    }
     
     class THPauseMenu : public Gui::GameGuiWnd {
         THPauseMenu() noexcept
@@ -3326,7 +3436,9 @@ namespace TH06 {
                 //WORD key_last = *(WORD*)(0x69D908);
                 if (Gui::KeyboardInputGetRaw('R') || (key & 0x124) == 0x124) { // ctrl+shift+down or R
                     *(DWORD*)(thiz) = 7;
-                    threstartflag_normalgame = true;
+                    const bool stagePractice = GetMemContent<uint8_t>(0x69d4c3) != 0;
+                    thRestartFlag = stagePractice;
+                    threstartflag_normalgame = !stagePractice;
                     DisableShakeScreenEffect();
                 }
             }
@@ -3465,6 +3577,7 @@ namespace TH06 {
         if (thRestartFlag) {
             th06_white_screen.Enable();
             thRestartFlag = false;
+            *reinterpret_cast<uint8_t*>(0x69d4c3) = 1;
             pCtx->Eip = 0x43738c;
         } else {
             thPracParam.Reset();
@@ -3940,7 +4053,7 @@ namespace TH06 {
                 int8_t diff = *(int8_t*)(0x69bcb0);
                 int32_t spell_id = *(int8_t*)(0x5A5F98);
                 TH06Save::singleton().AddCapture(spell_id, diff, cur_player_type);
-                BossCapture::Settle(BossCapture::kCaptured);
+                BossCaptureNativeSpellSucceeded();
             }
         })
     EHOOK_DY(th06_spellTimeout, 0x412056, 10,
@@ -4026,6 +4139,7 @@ namespace TH06 {
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
         EnableAllHooks(TH06_SavesHook);
+        BossCaptureInstallNativeSpellEvents(6);
 
         th06_white_screen.Setup();
         th06_result_screen_create.Setup();

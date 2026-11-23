@@ -64,6 +64,32 @@ thprac_c7_extension(game_volume shared game-volume/entry.cpp game-volume/volume.
 target_link_libraries(game_volume PRIVATE comctl32 shell32)
 thprac_c7_extension(f11_settings game settings/entry.cpp)
 thprac_c7_extension(game_repairs game repairs/entry.cpp)
+thprac_c7_extension(quick_practice shared quick-practice/entry.cpp quick-practice/native_menu.cpp)
+target_link_libraries(quick_practice PRIVATE user32)
+thprac_c7_extension(game_freeze game game-freeze/entry.cpp)
+target_link_libraries(game_freeze PRIVATE user32)
 
+thprac_c7_extension(game_bgm game game-bgm/entry.cpp)
+target_link_libraries(game_bgm PRIVATE winmm)
+if(THPRAC_THTK_SOURCE AND THPRAC_THTK_BUILD)
+    add_executable(bgm_repack game-bgm/repack_metadata.cpp)
+    thprac_native(bgm_repack)
+    target_include_directories(bgm_repack PRIVATE "${THPRAC_THTK_SOURCE}" "${THPRAC_THTK_BUILD}")
+    target_link_libraries(bgm_repack PRIVATE "${THPRAC_THTK_BUILD}/thtk/thtk.lib")
+    add_custom_command(TARGET bgm_repack POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:thprac>/plugins/game"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:bgm_repack>"
+            "$<TARGET_FILE_DIR:thprac>/plugins/game/bgm_repack.exe" VERBATIM)
+    add_dependencies(game_bgm bgm_repack)
+endif()
+foreach(script IN ITEMS bgm_bridge.py bgm_library.py prepare_bgm.py)
+    configure_file("game-bgm/${script}" "${CMAKE_CURRENT_BINARY_DIR}/game-bgm/${script}" COPYONLY)
+    add_custom_target("game_bgm_${script}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:thprac>/plugins/game"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_BINARY_DIR}/game-bgm/${script}"
+            "$<TARGET_FILE_DIR:thprac>/plugins/game/${script}")
+    add_dependencies(game_bgm "game_bgm_${script}")
+endforeach()
 
 thprac_c7_extension(sdk_example game DISABLED_BY_DEFAULT sdk-example/entry.cpp)

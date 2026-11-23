@@ -16,6 +16,7 @@
 #include "thprac_games_dx9.h"
 #include "thprac_games_hooks.h"
 #include "thprac_boss_capture.h"
+#include "thprac_native_spell_profiles.h"
 #include "thprac_route_trace.h"
 
 #include <metrohash128.h>
@@ -40,6 +41,7 @@
 
 namespace THPrac {
 #include "thprac_boss_capture_runtime.inl"
+#include "thprac_native_spell_events.inl"
 #include "thprac_route_native.inl"
 void GameStatusHudOptions()
 {

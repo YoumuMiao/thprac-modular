@@ -1,5 +1,5 @@
 {
-  "zh": "为 TH15 提供章节记录与重试、固定种子、专项路线和判定框。",
-  "en": "Adds chapter records and retries, fixed seeds, route tools, and hitboxes to TH15.",
-  "ja": "TH15 にチャプター記録とリトライ、固定シード、ルート機能、当たり判定表示を追加します。"
+  "zh": "为 TH15 提供章节记录与重试、固定种子、专项路线和判定框；符卡收取按游戏原生结算前后的记录和成功事件判定。",
+  "en": "Adds chapter records and retries, fixed seeds, route tools, and hitboxes to TH15. Spell captures follow native before/after records and successful capture events.",
+  "ja": "TH15 にチャプター記録とリトライ、固定シード、ルート機能、当たり判定表示を追加します。スペル取得はゲーム本来の終了前後の記録と取得成功イベントで判定します。"
 }

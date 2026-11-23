@@ -21,7 +21,7 @@
 #include <imgui.h>
 #include <cmath>
 #include <algorithm>
-#include "..\3rdParties\d3d8\include\d3d8.h"
+#include <legacy-dx8/d3d8.h>
 
 
 namespace THPrac

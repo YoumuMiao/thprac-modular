@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -13,7 +14,9 @@
 #include <limits>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <vector>
+#include <iterator>
 #include <cstring>
 #include <sstream>
 #include <map>
@@ -357,8 +360,24 @@ namespace TH15 {
             int32_t missesAtSettlement, bombsAtSettlement;
             bool chapterCleared;
             bool bossSection, replay;
+            // In-memory attribution only; score15chapter.dat still stores the
+            // unchanged chapter/section counter arrays in format version 5.
+            uint64_t attemptSerial = 0;
         };
         std::vector<PendingCapture> pendingCaptures;
+        uint64_t attemptSerial = 0;
+        struct NativeSpellAttempt {
+            uint64_t attemptSerial = 0;
+            int mode = 0, stage = 0, section = 0, diff = 0, player = 0;
+            bool replay = false, resultKnown = false;
+        };
+        std::vector<NativeSpellAttempt> nativeSpellAttempts;
+        struct NativeSpellFinalize {
+            NativeSpellAttempt attempt;
+            uintptr_t spell = 0, score = 0, counter = 0;
+            uint32_t nativeId = 0, countBefore = 0;
+            bool armed = false, success = false;
+        } nativeSpellFinalize;
         bool loaded = false;
         bool active = false;
         bool failed = false;
@@ -381,6 +400,10 @@ namespace TH15 {
         bool replayDisplayOnly = false;
         bool captureRateEnabled = true;
         bool captureRateResumePending = false;
+        // game_start runs in the stage loader, while Update runs in the GUI
+        // loop. Keep tracker resets and persistence on the Update side.
+        // 0 = idle, 1 = live counters being reset, 2 = start ready to consume.
+        std::atomic<int> runStartResetState{0};
         bool onlyCurrentPracticeChapter = false;
         bool hudChapterViewLoaded = false;
         int displayMode = 0, displayStage = 0, displayChapter = 0, displayDiff = 0, displayPlayer = 0;
@@ -391,6 +414,47 @@ namespace TH15 {
         int32_t scoreAtStart = 0, maxPointAtStart = 0, activeBluePoints = 0;
         int32_t lastMisses = 0, lastBombs = 0;
         TH15ChapterSave() = default;
+
+        void BeginNativeAttempt()
+        {
+            ++attemptSerial;
+        }
+
+        void TraceNativeSpell(const char* event, const NativeSpellFinalize& state,
+            uint32_t countAfter = 0, bool resultKnown = false) const
+        {
+            // Optional diagnostics never run in the frame/shot processing path.
+            static const bool enabled = [] {
+                char value[2]{};
+                return GetEnvironmentVariableA("THPRAC_NATIVE_CAPTURE_TRACE", value, 2) == 1
+                    && value[0] == '1';
+            }();
+            if (!enabled) return;
+            static unsigned logged = 0;
+            if (logged >= 96) return;
+            char appData[MAX_PATH]{}, path[MAX_PATH]{};
+            if (!GetEnvironmentVariableA("APPDATA", appData, MAX_PATH)
+                || sprintf_s(path, "%s\\ShanghaiAlice\\th15\\thprac_native_capture.log", appData) < 0) return;
+            std::ofstream log(path, std::ios::out | std::ios::app);
+            if (!log.is_open()) return;
+            ++logged;
+            log << std::format("event={} id={} armed={} serial={} section={} diff={} player={} active={} activeSection={} activeSerial={} intro={} gap={} replay={} success={} known={} before={} after={} ledger={} custom={} native={}\n",
+                event, state.nativeId, state.armed, state.attempt.attemptSerial,
+                state.attempt.section, state.attempt.diff, state.attempt.player,
+                active, activeSection, attemptSerial, bossIntroPending, bossGapPending,
+                replayDisplayOnly, state.success, resultKnown, state.countBefore, countAfter,
+                nativeSpellAttempts.size(), g_th15CaptureRateEnabled, g_th15NativeCaptureRateEnabled);
+        }
+
+        void RememberNativeSpellAttempt(const PendingCapture& capture)
+        {
+            if (!capture.bossSection || !TH15SpellCardId(capture.section, capture.diff)) return;
+            const auto known = std::find_if(nativeSpellAttempts.begin(), nativeSpellAttempts.end(),
+                [&](const auto& item) { return item.attemptSerial == capture.attemptSerial; });
+            if (known == nativeSpellAttempts.end())
+                nativeSpellAttempts.push_back({capture.attemptSerial, capture.mode, capture.stage,
+                    capture.section, capture.diff, capture.player, capture.replay, false});
+        }
 
         static int BossSectionStage(int section)
         {
@@ -930,6 +994,9 @@ namespace TH15 {
                 activeBluePoints, maxPointAtStart, ReadMaxPoint(), *(int32_t*)0x4E740C,
                 misses, bombs, true,
                 activeIsBossSection, replayDisplayOnly });
+            auto& capture = pendingCaptures.back();
+            capture.attemptSerial = attemptSerial;
+            RememberNativeSpellAttempt(capture);
         }
 
         void RecordInterruptedAttempt()
@@ -956,7 +1023,10 @@ namespace TH15 {
                 capture.missesAtSettlement = misses;
                 capture.bombsAtSettlement = bombs;
                 capture.chapterCleared = true;
-                const bool success = misses == capture.missesAtStart && bombs == capture.bombsAtStart;
+                const bool spell = capture.bossSection && TH15SpellCardId(capture.section, capture.diff) != 0;
+                // Spell capture is recorded only by the native finalizer. The
+                // ordinary chapter metrics retain this original sampling point.
+                const bool success = !spell && misses == capture.missesAtStart && bombs == capture.bombsAtStart;
                 if (success)
                     RecordCapture(capture);
                 RecordChapterStats(capture);
@@ -967,6 +1037,7 @@ namespace TH15 {
         void StartBossPhaseAfterEmpty(int32_t stage, int32_t chapter, int32_t misses,
             int32_t bombs)
         {
+            BeginNativeAttempt();
             HoldPreviousChapterDisplay(activeMode, activeStage, activeChapter,
                 activeIsBossSection, activeSection, activeDiff, activePlayer,
                 ScoreSourceIndex(replayDisplayOnly, activeMode));
@@ -1226,6 +1297,16 @@ namespace TH15 {
             return true;
         }
 
+        void BeginRunCounterReset()
+        {
+            runStartResetState.store(1, std::memory_order_release);
+        }
+
+        void EndRunCounterReset()
+        {
+            runStartResetState.store(2, std::memory_order_release);
+        }
+
         void BeginRun(int32_t stage, int32_t misses, int32_t bombs,
             int32_t isPractice, int32_t practiceSection, int32_t practiceMenuStage,
             int32_t difficulty, int32_t shotType, bool replayPlayback = false)
@@ -1286,6 +1367,7 @@ namespace TH15 {
                 ScoreSourceIndex(replayPlayback, mode));
 
             active = true;
+            BeginNativeAttempt();
             failed = false;
             settlementPending = false;
             settlementCaptured = false;
@@ -1511,6 +1593,7 @@ namespace TH15 {
                     nextIsBossSection, nextActiveSection, nextDiff, nextPlayer,
                     ScoreSourceIndex(replayDisplayOnly, nextMode));
                 active = true;
+                BeginNativeAttempt();
                 activeMode = nextMode;
                 activeStage = stage - 1;
                 activeChapter = nextActiveChapter;
@@ -1576,6 +1659,19 @@ namespace TH15 {
             int32_t isPractice, int32_t practiceSection, int32_t practiceMenuStage,
             int32_t difficulty, int32_t shotType, bool replayPlayback = false)
         {
+            int resetState = 2;
+            if (runStartResetState.compare_exchange_strong(resetState, 0, std::memory_order_acq_rel)) {
+                SetCaptureRateEnabled(g_th15CaptureRateEnabled || g_th15ScoreRecordingEnabled || g_th15ChapterHudEnabled);
+                SetOnlyCurrentPracticeChapter(g_th15OnlyCurrentPracticeChapterThisRun);
+                BeginRun(stage, 0, 0, isPractice, practiceSection, practiceMenuStage,
+                    difficulty, shotType, replayPlayback);
+                // These arguments may have been sampled before the loader
+                // reset the live counters. They belong to the abandoned try.
+                misses = bombs = 0;
+            } else if (resetState == 1) {
+                // Do not mistake the loader's counter reset for an extra retry.
+                return;
+            }
             Load();
             if (!captureRateEnabled) {
                 active = false;
@@ -1788,6 +1884,7 @@ namespace TH15 {
                 HoldPreviousChapterDisplay(mode, targetStage, targetChapter, false, 0,
                     diff, player, ScoreSourceIndex(replayDisplayOnly, mode));
                 active = true;
+                BeginNativeAttempt();
                 failed = false;
                 completedAwaitingNext = false;
                 missesAtStart = misses;
@@ -1862,6 +1959,120 @@ namespace TH15 {
         bool IsActive() const { return active; }
         bool IsFailed() const { return failed; }
         bool IsReplayDisplayOnly() const { return replayDisplayOnly; }
+        void NativeSpellBefore()
+        {
+            nativeSpellFinalize = {};
+            if (!captureRateEnabled || !g_th15CaptureRateEnabled) {
+                TraceNativeSpell("before-disabled", nativeSpellFinalize);
+                return;
+            }
+            const auto spell = GetMemContent<uintptr_t>(0x4e9a70);
+            if (!spell || !(GetMemContent<uint32_t>(spell + 0x78) & 1)) {
+                TraceNativeSpell("before-inactive", nativeSpellFinalize);
+                return;
+            }
+            const uint32_t nativeId = GetMemContent<uint32_t>(spell + 0x74);
+            nativeSpellFinalize.spell = spell;
+            nativeSpellFinalize.nativeId = nativeId;
+            if (nativeId >= 119) {
+                TraceNativeSpell("before-invalid-id", nativeSpellFinalize);
+                return;
+            }
+            const auto replayState = GetMemContent<uintptr_t>(0x4e9bc4);
+            const bool replay = replayState && GetMemContent<int32_t>(replayState + 0xc) == 1;
+            // The native record ID is zero-based; the existing section mapping
+            // used by the native-history table is one-based.
+            for (auto it = nativeSpellAttempts.rbegin(); it != nativeSpellAttempts.rend(); ++it) {
+                if (it->resultKnown || it->replay != replay
+                    || TH15SpellCardId(it->section, it->diff) != nativeId + 1) continue;
+                nativeSpellFinalize.attempt = *it;
+                nativeSpellFinalize.armed = true;
+                break;
+            }
+            if (!nativeSpellFinalize.armed && active
+                && activeIsBossSection && !bossIntroPending && !bossGapPending
+                && replayDisplayOnly == replay
+                && TH15SpellCardId(activeSection, activeDiff) == nativeId + 1) {
+                auto known = std::find_if(nativeSpellAttempts.begin(), nativeSpellAttempts.end(),
+                    [&](const auto& item) { return item.attemptSerial == attemptSerial; });
+                if (known == nativeSpellAttempts.end()) {
+                    nativeSpellAttempts.push_back({attemptSerial, activeMode, activeStage,
+                        activeSection, activeDiff, activePlayer, replayDisplayOnly, false});
+                    known = std::prev(nativeSpellAttempts.end());
+                }
+                if (known->resultKnown) {
+                    TraceNativeSpell("before-duplicate", nativeSpellFinalize, 0, true);
+                    return;
+                }
+                nativeSpellFinalize.attempt = *known;
+                nativeSpellFinalize.armed = true;
+            }
+            if (!nativeSpellFinalize.armed) {
+                TraceNativeSpell("before-unmatched", nativeSpellFinalize);
+                return;
+            }
+            nativeSpellFinalize.score = GetMemContent<uintptr_t>(0x4e9bc8);
+            const int recordShot = GetMemContent<int32_t>(0x4e7404) + GetMemContent<int32_t>(0x4e7408);
+            if (nativeSpellFinalize.score && nativeId < 119 && recordShot >= 0 && recordShot < 4) {
+                const auto flags = GetMemContent<uint32_t>(0x4e7794);
+                const unsigned recordGroup = (flags & 0x300) == 0 ? 1 : 0;
+                const unsigned spellPractice = (flags & 0x30) == 0x20 ? 1 : 0;
+                nativeSpellFinalize.counter = nativeSpellFinalize.score + recordShot * 0xa4a0
+                    + recordGroup * 0x5188 + nativeId * 0x9c + 0x958 + spellPractice * 4;
+                nativeSpellFinalize.countBefore = GetMemContent<uint32_t>(nativeSpellFinalize.counter);
+            }
+            TraceNativeSpell("before-armed", nativeSpellFinalize);
+        }
+        void NativeSpellSucceeded()
+        {
+            if (nativeSpellFinalize.armed
+                && nativeSpellFinalize.spell == GetMemContent<uintptr_t>(0x4e9a70))
+                nativeSpellFinalize.success = true;
+            TraceNativeSpell(nativeSpellFinalize.armed ? "success" : "success-unarmed", nativeSpellFinalize);
+        }
+        void NativeSpellAfter()
+        {
+            const auto before = nativeSpellFinalize;
+            nativeSpellFinalize = {};
+            if (!before.armed || !captureRateEnabled || !g_th15CaptureRateEnabled) {
+                TraceNativeSpell("after-unarmed", before);
+                return;
+            }
+            if (GetMemContent<uintptr_t>(0x4e9a70) != before.spell
+                || GetMemContent<uint32_t>(before.spell + 0x74) != before.nativeId) {
+                TraceNativeSpell("after-identity-mismatch", before);
+                return;
+            }
+            const bool sameScore = before.counter && before.score == GetMemContent<uintptr_t>(0x4e9bc8);
+            const auto countAfter = sameScore ? GetMemContent<uint32_t>(before.counter) : before.countBefore;
+            // Counter deltas are supplementary: replay, saturation and the
+            // independent native-history toggle can all leave counts unchanged.
+            const bool captured = before.success || (sameScore && countAfter > before.countBefore);
+            for (auto& attempt : nativeSpellAttempts) {
+                if (attempt.attemptSerial != before.attempt.attemptSerial) continue;
+                if (attempt.resultKnown) {
+                    TraceNativeSpell("after-duplicate", before, countAfter, true);
+                    return;
+                }
+                attempt.resultKnown = true;
+                if (captured) {
+                    PendingCapture capture{};
+                    capture.mode = attempt.mode; capture.stage = attempt.stage;
+                    capture.section = attempt.section; capture.diff = attempt.diff;
+                    capture.player = attempt.player; capture.bossSection = true;
+                    capture.replay = attempt.replay;
+                    RecordCapture(capture);
+                }
+                if (active && attemptSerial == attempt.attemptSerial && activeMode == attempt.mode
+                    && activeStage == attempt.stage && activeSection == attempt.section
+                    && activeDiff == attempt.diff && activePlayer == attempt.player
+                    && replayDisplayOnly == attempt.replay)
+                    failed = !captured;
+                TraceNativeSpell(captured ? "after-captured" : "after-failed", before, countAfter, true);
+                return;
+            }
+            TraceNativeSpell("after-no-ledger", before, countAfter);
+        }
         void OnBulletClearFinished(int32_t misses, int32_t bombs)
         {
             ResolvePendingCaptures(misses, bombs);
@@ -2308,6 +2519,9 @@ namespace TH15 {
             displayValid = false;
             replayDisplayOnly = false;
             pendingCaptures.clear();
+            nativeSpellAttempts.clear();
+            nativeSpellFinalize = {};
+            BeginNativeAttempt();
             captureRateResumePending = false;
             memset(replayCurrent, 0, sizeof(replayCurrent));
             memset(replaySectionCurrent, 0, sizeof(replaySectionCurrent));
@@ -2323,6 +2537,9 @@ namespace TH15 {
                 transitionSnapshot.valid = false;
                 transitionSnapshotUntil = 0;
                 pendingCaptures.clear();
+                nativeSpellAttempts.clear();
+                nativeSpellFinalize = {};
+                BeginNativeAttempt();
                 captureRateResumePending = false;
             } else {
                 captureRateResumePending = true;
@@ -2640,13 +2857,21 @@ namespace TH15 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mSection, mPhase,
+            mDlg, mPureSignFixedSeed, mPureSignSeed, mDoremyNormal1Phase, mEnhanced_para,
+            mChapter, mScore, mLife, mLifeFragment, mBomb,
+            mBombFragment, mPower, mValue, mGraze, mReisenShield,
+            mBossHp, g_th15OnlyCurrentPracticeChapter)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             switch (state) {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4e7410);
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4e7410);
                 SetFade(0.8f, 0.1f);
                 Open();
                 thPracParam.Reset();
@@ -2655,6 +2880,8 @@ namespace TH15 {
             case 3:
                 SetFade(0.8f, 0.1f);
                 Close();
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -2682,7 +2909,7 @@ namespace TH15 {
                 thPracParam.power = *mPower;
                 thPracParam.value = *mValue;
                 thPracParam.graze = *mGraze;
-                if (GetMemContent(CHARACTER) == 3)
+                if (IsReisen())
                     thPracParam.reisen_shield = *mReisenShield;
                 break;
             case 4:
@@ -2695,6 +2922,12 @@ namespace TH15 {
         }
 
     protected:
+        static bool IsReisen()
+        {
+            const auto* preview = QuickPractice::Preview();
+            return (preview ? preview->shot : GetMemContent<int>(CHARACTER)) == 3;
+        }
+
         virtual void OnLocaleChange() override
         {
             SetTitle(S(TH_MENU));
@@ -2832,7 +3065,7 @@ namespace TH15 {
                 mScore();
                 mScore.RoundDown(10);
 
-                if (GetMemContent(CHARACTER) == 3)
+                if (IsReisen())
                     mReisenShield();
             }
 
@@ -2982,6 +3215,8 @@ namespace TH15 {
 
         int mDiffculty = 0;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -3050,6 +3285,17 @@ namespace TH15 {
         TH15RouteTrace() = default;
         SINGLETON(TH15RouteTrace)
     public:
+        struct PracticeOrigin {
+            int section = 0;
+            int phase = 0;
+            int stageFrame = 0;
+
+            bool Matches(int targetSection, int targetPhase) const
+            {
+                return section != 0 && section == targetSection && phase == targetPhase;
+            }
+        };
+
         struct RouteInfo {
             std::string file;
             std::string label;
@@ -3059,6 +3305,7 @@ namespace TH15 {
             int shot = 0;
             int source = 0;
             int points = 0;
+            PracticeOrigin practice;
         };
 
         static constexpr const char* kRouteDir = "thprac_route";
@@ -3130,7 +3377,7 @@ namespace TH15 {
         size_t capturePointCount = 0;
         int captureFrame = 0;
         int captureChapter = -1;
-        // Last value of the game's chapter frame counter seen while sampling.
+        // Last value of the sampling clock: stage for a warp, chapter otherwise.
         int captureLastCounter = -1;
 
         // Practice jump anchor. thprac jumps straight into the selected chapter
@@ -3174,6 +3421,9 @@ namespace TH15 {
         unsigned lastWarpGeneration = 0;
         bool practiceAnchorPending = false;
         int practiceAnchorWait = 0;
+        bool useCaptureAsReference = false;
+        PracticeOrigin capturePractice;
+        PracticeOrigin loadedPractice;
         // Diagnostic throttles (see TraceLog).
         int debugTick = 0;
         int debugLastChapter = -1;
@@ -3295,8 +3545,15 @@ namespace TH15 {
             return clock && clock->mode == 1 ? clock->frames + warpWait - clock->warpWait : -1;
         }
 
+        bool UsesRecordedPracticeStart() const
+        {
+            return loadedPractice.section != 0 && !practiceAnchorFollowed;
+        }
+
         bool PracticeScriptRange(int section, size_t& begin, size_t& end) const
         {
+            if (loadedPractice.section != 0)
+                return false;
             const auto* clock = FindTH15RouteClock(section, thPracParam.phase, GetMemContent<int32_t>(0x4E7410));
             if (!clock || loadedPoints.size() < 2)
                 return false;
@@ -3315,7 +3572,7 @@ namespace TH15 {
                 begin = static_cast<size_t>(mark.frame);
                 end = next < loadedMarks.size() ? static_cast<size_t>(loadedMarks[next].frame) : loadedPoints.size();
                 if (end > loadedPoints.size() || end <= begin + 1)
-                    return false;
+                    continue;
                 if (clock->mode == 3 && (clock->loopBegin < 0 || clock->loopEnd <= clock->loopBegin
                     || begin + static_cast<size_t>(clock->loopEnd) > end))
                     return false;
@@ -3359,7 +3616,9 @@ namespace TH15 {
         int PracticeSample(int section, int counter, int& lower, int& upper)
         {
             const int start = PracticeStartSample(section);
-            if (counter < practiceBaselineCounter)
+            if (UsesRecordedPracticeStart())
+                counter = ReadStageFrames();
+            else if (counter < practiceBaselineCounter)
                 practiceBaselineCounter = counter;
             int64_t progress = static_cast<int64_t>(start)
                 + std::max<int64_t>(0, static_cast<int64_t>(counter) - practiceBaselineCounter);
@@ -3462,6 +3721,12 @@ namespace TH15 {
                     else if (cells[0] == "source") info.source = std::stoi(cells[1]);
                     else if (cells[0] == "points") info.points = std::stoi(cells[1]);
                     else if (cells[0] == "stamp") info.stamp = cells[1];
+                    else if (cells[0] == "practice" && cells.size() >= 4) {
+                        const PracticeOrigin practice { std::stoi(cells[1]), std::stoi(cells[2]), std::stoi(cells[3]) };
+                        if (practice.section <= 0 || practice.phase < 0 || practice.stageFrame < 0)
+                            return false;
+                        info.practice = practice;
+                    }
                 } catch (...) {
                     return false;
                 }
@@ -3551,15 +3816,16 @@ namespace TH15 {
             capturePointCount = 0;
             captureFrame = 0;
             captureLastCounter = -1;
-            captureChapter = CurrentChapter();
-            captureMarks.push_back({ captureChapter, 0, ReadChapterFrames(), CurrentRouteSection() });
+            capturePractice = {};
+            if (thPracParam.mode == 1 && thPracParam.section > 0 && stage == thPracParam.stage)
+                capturePractice = { thPracParam.section, thPracParam.phase, 0 };
             capturing = true;
         }
 
-        bool SaveCapture()
+        std::string SaveCapture()
         {
             if (capturePoints.size() < 20)
-                return false;
+                return {};
             PushCurrentDirectory(L"%appdata%\\ShanghaiAlice\\th15");
             CreateDirectoryA(kRouteDir, nullptr);
 
@@ -3581,7 +3847,7 @@ namespace TH15 {
                 std::ofstream file(temporary, std::ios::out | std::ios::trunc);
                 if (!file.is_open()) {
                     PopCurrentDirectory();
-                    return false;
+                    return {};
                 }
                 file << "#thprac-route-v3\n";
                 file << "label\t" << SanitizeLabel(captureLabel) << '\n';
@@ -3592,6 +3858,9 @@ namespace TH15 {
                 file << "points\t" << capturePoints.size() << '\n';
                 file << "frames\t" << captureFrame << '\n';
                 file << "stamp\t" << stamp << '\n';
+                if (capturePractice.section != 0)
+                    file << "practice\t" << capturePractice.section << '\t' << capturePractice.phase
+                         << '\t' << capturePractice.stageFrame << '\n';
                 for (const auto& mark : captureMarks)
                     file << "chapter\t" << mark.chapter << '\t' << mark.frame
                          << '\t' << mark.chapterFrames << '\t' << mark.section << '\n';
@@ -3607,14 +3876,14 @@ namespace TH15 {
             if (!written) {
                 DeleteFileA(temporary.c_str());
                 PopCurrentDirectory();
-                return false;
+                return {};
             }
             const bool moved = MoveFileExA(temporary.c_str(), path.c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
             if (!moved)
                 DeleteFileA(temporary.c_str());
             PopCurrentDirectory();
-            return moved;
+            return moved ? path.substr(directory.size()) : std::string();
         }
 
         bool ReplayNameMatches(const std::wstring& name) const
@@ -3625,11 +3894,12 @@ namespace TH15 {
             return _wcsicmp(name.c_str(), playing.c_str()) == 0;
         }
 
-        void EnsureLoaded(const std::string& file)
+        void EnsureLoaded(const RouteInfo& route)
         {
-            if (loadedFile == file)
+            if (loadedFile == route.file)
                 return;
-            loadedFile = file;
+            loadedFile = route.file;
+            loadedPractice = route.practice;
             // Sample indices belong to this file. A newly selected route must
             // never inherit an anchor resolved against another recording.
             practiceAnchorValid = false;
@@ -3640,7 +3910,7 @@ namespace TH15 {
             loadedBreaks.clear();
             loadedMarks.clear();
             PushCurrentDirectory(L"%appdata%\\ShanghaiAlice\\th15");
-            LoadRoute(std::string(kRouteDir) + "\\" + file, loadedPoints, loadedBreaks, loadedMarks);
+            LoadRoute(std::string(kRouteDir) + "\\" + route.file, loadedPoints, loadedBreaks, loadedMarks);
             PopCurrentDirectory();
             TraceLog(std::format("route file={} points={} marks={}",
                 loadedFile, loadedPoints.size(), loadedMarks.size()));
@@ -3651,17 +3921,29 @@ namespace TH15 {
             const RouteInfo* selected = nullptr;
             if (selectedRoute >= 0 && selectedRoute < (int)routes.size())
                 selected = &routes[selectedRoute];
+            const int section = thPracParam.mode == 1 ? thPracParam.section : 0;
+            const auto matchesPractice = [&](const RouteInfo& route) {
+                return route.practice.Matches(section, thPracParam.phase);
+            };
+            if (selected && selected->practice.section != 0
+                && (selected->stage != stage || !matchesPractice(*selected)))
+                selected = nullptr;
             if (!autoMatch)
                 return selected;
             if (selected && selected->stage == stage && selected->diff == diff
                 && selected->shot == shot)
                 return selected;
-            // routes are sorted newest first, so the first hit is the latest run.
+            // Prefer a recording of this warp, then use the newest full-stage route.
+            const RouteInfo* stageRoute = nullptr;
             for (const auto& route : routes) {
-                if (route.stage == stage && route.diff == diff && route.shot == shot)
+                if (route.stage != stage || route.diff != diff || route.shot != shot)
+                    continue;
+                if (matchesPractice(route))
                     return &route;
+                if (!stageRoute && route.practice.section == 0)
+                    stageRoute = &route;
             }
-            return nullptr;
+            return stageRoute;
         }
 
     public:
@@ -3689,7 +3971,7 @@ namespace TH15 {
             ScanReplays();
         }
 
-        void ScanRoutes()
+        void ScanRoutes(const std::string& prefer = {})
         {
             const std::string keep = (selectedRoute >= 0 && selectedRoute < (int)routes.size())
                 ? routes[selectedRoute].file
@@ -3717,10 +3999,10 @@ namespace TH15 {
                 return left.stamp > right.stamp;
             });
             selectedRoute = -1;
-            std::string wanted;
-            if (!keep.empty())
+            std::string wanted = prefer;
+            if (wanted.empty() && !keep.empty())
                 wanted = keep;
-            else if (settingsSelectionPending)
+            else if (wanted.empty() && settingsSelectionPending)
                 wanted = settingsSelection;
             settingsSelectionPending = false;
             if (!wanted.empty()) {
@@ -3855,12 +4137,18 @@ namespace TH15 {
                 return;
             capturing = false;
             capturePointCount = 0;
-            const bool saved = save && SaveCapture();
+            const std::string saved = save ? SaveCapture() : std::string();
             capturePoints.clear();
             captureBreaks.clear();
             captureMarks.clear();
-            if (saved)
-                ScanRoutes();
+            if (!saved.empty()) {
+                ScanRoutes(useCaptureAsReference ? saved : std::string());
+                if (useCaptureAsReference && selectedRoute >= 0 && routes[selectedRoute].file == saved) {
+                    displayEnabled = true;
+                    SaveSettings();
+                    useCaptureAsReference = false;
+                }
+            }
         }
 
         void OnFrame()
@@ -3869,13 +4157,14 @@ namespace TH15 {
             UpdatePracticeAnchor();
             const bool replayActive = THGuiRep::singleton().mRepStatus;
             if (replayActive) {
-                if (!lastReplayActive)
-                    TryStartCapture();
+                if (!lastReplayActive && !TryStartCapture())
+                    return;
                 if (capturing)
                     SamplePlayer();
             } else if (lastReplayActive) {
                 FinishCapture(true);
                 extractArmed = false;
+                useCaptureAsReference = false;
             }
             lastReplayActive = replayActive;
         }
@@ -3898,7 +4187,7 @@ namespace TH15 {
             const RouteInfo* target = ResolveTarget(stage, diff, shot);
             if (!target)
                 return;
-            EnsureLoaded(target->file);
+            EnsureLoaded(*target);
             if (loadedPoints.size() < 2)
                 return;
 
@@ -4093,7 +4382,7 @@ namespace TH15 {
 
     private:
         void SamplePlayer();
-        void TryStartCapture();
+        bool TryStartCapture();
         void UpdatePracticeAnchor();
         void FollowRuntimeChapter();
         bool ResolvePracticeAnchor(int section, size_t& sample, size_t& end);
@@ -4108,6 +4397,16 @@ namespace TH15 {
     {
         if (loadedMarks.empty() || loadedPoints.size() < 2)
             return false;
+        // A replay of this warp already starts at the selected practice entry.
+        // The native chapter index can remain stale until the next chapter.
+        if (loadedPractice.section != 0) {
+            if (!loadedPractice.Matches(section, thPracParam.phase))
+                return false;
+            sample = 0;
+            end = loadedMarks.size() > 1 ? static_cast<size_t>(loadedMarks[1].frame) : loadedPoints.size();
+            practiceAnchorChapter = loadedMarks.front().chapter;
+            return end > 0 && end <= loadedPoints.size();
+        }
         if (PracticeScriptRange(section, sample, end)) {
             const auto* clock = FindTH15RouteClock(section, thPracParam.phase, GetMemContent<int32_t>(0x4E7410));
             practiceAnchorChapter = clock->entryChapter;
@@ -4124,30 +4423,23 @@ namespace TH15 {
         } else if (section > 0) {
             targetSection = section;
         }
-        int best = -1;
-        for (size_t i = 0; i < loadedMarks.size() && best < 0; ++i) {
+        for (size_t i = 0; i < loadedMarks.size(); ++i) {
             const auto& mark = loadedMarks[i];
             if (mark.frame < 0 || static_cast<size_t>(mark.frame) >= loadedPoints.size())
                 continue;
-            if (targetChapter >= 0 ? mark.chapter == targetChapter
-                                   : mark.section == targetSection)
-                best = static_cast<int>(i);
+            if (targetChapter >= 0 ? mark.chapter != targetChapter : mark.section != targetSection)
+                continue;
+            sample = static_cast<size_t>(mark.frame);
+            end = i + 1 < loadedMarks.size() ? static_cast<size_t>(loadedMarks[i + 1].frame) : loadedPoints.size();
+            if (end > loadedPoints.size() || end <= sample + 1)
+                continue;
+            practiceAnchorChapter = mark.chapter;
+            TraceLog(std::format(
+                "match section={} targetChapter={} targetSection={} mark={} markChapter={} sample={} end={}",
+                section, targetChapter, targetSection, i, mark.chapter, sample, end));
+            return true;
         }
-        if (best < 0)
-            return false;
-        sample = static_cast<size_t>(loadedMarks[best].frame);
-        // Record which chapter the anchor landed on so a later chapter change can
-        // be told apart from the stale index the jump left behind.
-        practiceAnchorChapter = loadedMarks[best].chapter;
-        end = static_cast<size_t>(best + 1) < loadedMarks.size()
-            ? static_cast<size_t>(loadedMarks[best + 1].frame)
-            : loadedPoints.size();
-        if (end > loadedPoints.size() || end <= sample)
-            end = loadedPoints.size();
-        TraceLog(std::format(
-            "match section={} targetChapter={} targetSection={} mark={} markChapter={} sample={} end={}",
-            section, targetChapter, targetSection, best, loadedMarks[best].chapter, sample, end));
-        return end > sample + 1;
+        return false;
     }
 
     inline void TH15RouteTrace::UpdatePracticeAnchor()
@@ -4175,11 +4467,12 @@ namespace TH15 {
         if (practiceAnchorValid || practiceAwaitRuntimeChapter)
             FollowRuntimeChapter();
         if (practiceAnchorValid) {
+            const int counter = UsesRecordedPracticeStart() ? stageFrames : ReadChapterFrames();
             if (!followPlayerToRoute)
                 practiceAutopilotFrames = 0;
-            else if (ReadChapterFrames() != practiceLastCounter)
+            else if (counter != practiceLastCounter)
                 ++practiceAutopilotFrames;
-            practiceLastCounter = ReadChapterFrames();
+            practiceLastCounter = counter;
         }
         // Recover from a dropped anchor or a route reloaded. Resolve
         // again from the practice selection, but not on every single frame.
@@ -4218,7 +4511,7 @@ namespace TH15 {
             practiceAnchorPending = false;
             return;
         }
-        EnsureLoaded(target->file);
+        EnsureLoaded(*target);
         size_t sample = 0;
         size_t end = 0;
         const bool resolved = ResolvePracticeAnchor(section, sample, end);
@@ -4228,7 +4521,7 @@ namespace TH15 {
             // path and the next recorded chapter, after the warp is installed.
             practiceAnchorSample = static_cast<int>(sample);
             practiceAnchorEnd = static_cast<int>(end);
-            practiceBaselineCounter = ReadChapterFrames();
+            practiceBaselineCounter = loadedPractice.section ? loadedPractice.stageFrame : ReadChapterFrames();
             practiceAnchorRuntimeChapter = CurrentChapter();
             practiceAnchorFollowed = false;
             practiceAutopilotFrames = 0;
@@ -4259,7 +4552,7 @@ namespace TH15 {
         // selected chapter routine, so the game keeps this value until
         // the next chapter starts; following it dragged playback back to the
         // first chapter of the stage after a retry.
-        if (chapter <= 0)
+        if (chapter < 0 || (chapter == 0 && !loadedPractice.section))
             return;
         const auto* clock = FindTH15RouteClock(lastPracticeSection, thPracParam.phase,
             GetMemContent<int32_t>(0x4E7410));
@@ -4272,7 +4565,8 @@ namespace TH15 {
         }
         const int counter = ReadChapterFrames();
         int best = -1;
-        for (size_t i = 0; i < loadedMarks.size(); ++i) {
+        // The first mark of a practice recording belongs to the warp's start.
+        for (size_t i = loadedPractice.section ? 1 : 0; i < loadedMarks.size(); ++i) {
             if (loadedMarks[i].chapter == chapter) {
                 // Skip only the transient stage-entry mark, so a duplicate id
                 // later in the route resolves to the chapter actually entered.
@@ -4333,23 +4627,24 @@ namespace TH15 {
             chapter, practiceAnchorSample, practiceAnchorEnd, practiceBaselineCounter));
     }
 
-    inline void TH15RouteTrace::TryStartCapture()
+    inline bool TH15RouteTrace::TryStartCapture()
     {
-        if (capturing)
-            return;
         const bool armedMatch = extractArmed && ReplayNameMatches(armedReplay);
-        if (extractArmed && !armedMatch)
-            return;
-        if (!autoExtractReplay && !armedMatch)
-            return;
+        if ((extractArmed || !autoExtractReplay) && !armedMatch)
+            return true;
+        // Retry while the replay menu has reported playback but the stage or
+        // practice warp is still being initialized.
         const int stage = GetMemContent<int32_t>(0x4E73F0) - 1;
-        if (!ValidStage(stage))
-            return;
+        if (!ValidStage(stage) || !GetMemContent(PLAYER_PTR) || ReadStageFrames() <= 0
+            || (thPracParam.mode == 1 && (!thPracParam._playLock || stage != thPracParam.stage)))
+            return false;
         const std::wstring& name = THGuiRep::singleton().ReplayName();
         captureLabel = name.empty() ? std::string("replay") : utf16_to_utf8(name.c_str());
         BeginCapture(stage, GetMemContent<int32_t>(0x4E7410), GetMemContent<int32_t>(0x4E7404), 0);
+        useCaptureAsReference = armedMatch;
         if (armedMatch)
             extractArmed = false;
+        return true;
     }
 
     inline void TH15RouteTrace::SamplePlayer()
@@ -4376,19 +4671,17 @@ namespace TH15 {
             FinishCapture(true);
             return;
         }
-        // One sample per rendered frame keeps sample index == stage frame, so
-        // the display window can be positioned from progress alone.
         const int chapter = CurrentChapter();
         const int chapterFrames = ReadChapterFrames();
-        // The game counter advances once per gameplay frame. Sampling only when
-        // it moved keeps one sample per frame even if the game is paused or the
-        // render loop runs ahead of the logic.
-        if (!capturePoints.empty() && chapterFrames == captureLastCounter
-            && chapter == captureChapter) {
+        const int counter = capturePractice.section ? ReadStageFrames() : chapterFrames;
+        // Deduplicate renders while paused. A practice warp may skip the native
+        // chapter initializer, so its recording starts on the stage clock.
+        if (!capturePoints.empty() && counter == captureLastCounter && chapter == captureChapter)
             return;
-        }
-        captureLastCounter = chapterFrames;
-        if (chapter != captureChapter) {
+        captureLastCounter = counter;
+        if (capturePoints.empty())
+            capturePractice.stageFrame = ReadStageFrames();
+        if (capturePoints.empty() || chapter != captureChapter) {
             captureChapter = chapter;
             captureMarks.push_back({ chapter, captureFrame, chapterFrames, CurrentRouteSection() });
         }
@@ -4533,8 +4826,8 @@ namespace TH15 {
         SINGLETON(TH15InGameInfo)
 
     public:
-        int32_t mMissCount;
-        int32_t mBombCount;
+        std::atomic<int32_t> mMissCount{0};
+        std::atomic<int32_t> mBombCount{0};
     protected:
         virtual void OnLocaleChange() override
         {
@@ -4635,9 +4928,9 @@ namespace TH15 {
                 ImGui::Text(diff_pl.c_str());
 
                 ImGui::Columns(2);
-                ImGui::Text(S(THPRAC_INGAMEINFO_MISS_COUNT));ImGui::NextColumn();ImGui::Text("%8d",mMissCount);
+                ImGui::Text(S(THPRAC_INGAMEINFO_MISS_COUNT));ImGui::NextColumn();ImGui::Text("%8d",mMissCount.load());
                 ImGui::NextColumn();
-                ImGui::Text(S(THPRAC_INGAMEINFO_BOMB_COUNT));ImGui::NextColumn();ImGui::Text("%8d",mBombCount);
+                ImGui::Text(S(THPRAC_INGAMEINFO_BOMB_COUNT));ImGui::NextColumn();ImGui::Text("%8d",mBombCount.load());
                 ImGui::NextColumn();
                 if (g_adv_igi_options.th15_showShootingDownRate) {
                     int32_t cur_killed = *(int32_t*)(0x004E7488);
@@ -5342,8 +5635,11 @@ namespace TH15 {
                             "無限練習では該当区間のルートを繰り返します。",
                             "Infinite practice repeats the matching route segment."));
                 } else if (trace.practiceAnchorValid && !trace.practiceAnchorFollowed) {
-                    ImGui::TextDisabled("%s", label("本段暂按章节标记近似，尚未校准脚本时序。",
-                        "この区間は章マークによる近似です。", "This target uses approximate chapter timing."));
+                    ImGui::TextDisabled("%s", trace.UsesRecordedPracticeStart()
+                        ? label("已按录像的练习起点对齐。", "リプレイの練習開始位置に同期しました。",
+                            "Aligned to the replay's practice start.")
+                        : label("本段暂按章节标记近似，尚未校准脚本时序。",
+                            "この区間は章マークによる近似です。", "This target uses approximate chapter timing."));
                 }
                 if (ImGui::Button(label("重置手动补偿", "手動補正をリセット", "Reset manual offset")))
                     trace.practiceSkipAdjust = 0;
@@ -5371,9 +5667,9 @@ namespace TH15 {
                 ImGui::Checkbox(label("播放录像时自动提取", "リプレイ再生時に自動抽出",
                     "Extract automatically while a replay plays"), &trace.autoExtractReplay);
                 ImGui::TextWrapped("%s", label(
-                    "在游戏中播放选定的录像，工具会在播放期间逐帧记录自机位置，切换面数时自动分段保存。",
-                    "ゲーム内で選択したリプレイを再生すると、再生中の自機位置を毎フレーム記録し、ステージごとに保存します。",
-                    "Play the selected replay in game: the player position is sampled every frame and saved per stage."));
+                    "在游戏中播放录像时逐帧记录自机位置，按面保存。手动提取成功后会选中新路线并开启显示。",
+                    "リプレイ再生中の自機位置を毎フレーム記録し、ステージごとに保存します。手動抽出後は新しいルートを選択して表示します。",
+                    "Replay positions are sampled every frame and saved per stage. Manual extraction selects the new route and enables its display."));
 
                 if (trace.replayFiles.empty()) {
                     ImGui::TextDisabled("%s", label("未找到录像文件（%APPDATA%\\ShanghaiAlice\\th15\\replay）",
@@ -5404,13 +5700,13 @@ namespace TH15 {
                         trace.extractArmed = false;
                 }
                 if (trace.capturing) {
-                    ImGui::Text("%s", label("正在提取：%s  面数 %d  点数 %d", "抽出中：%s  ステージ %d  点数 %d",
+                    ImGui::Text(label("正在提取：%s  面数 %d  点数 %d", "抽出中：%s  ステージ %d  点数 %d",
                         "Extracting: %s  stage %d  points %d"),
-                        trace.captureLabel.c_str(), trace.captureStage, (int)trace.capturePointCount);
+                        trace.captureLabel.c_str(), trace.captureStage + 1, static_cast<int>(trace.capturePointCount));
                 } else if (trace.extractArmed) {
                     char name[512];
                     WideToUtf8(trace.armedReplay, name, sizeof(name));
-                    ImGui::Text("%s", label("等待播放：%s", "再生待ち：%s", "Waiting for: %s"), name);
+                    ImGui::Text(label("等待播放：%s", "再生待ち：%s", "Waiting for: %s"), name);
                 } else {
                     ImGui::TextDisabled("%s", label("未在提取", "抽出していません", "Not extracting"));
                 }
@@ -5482,16 +5778,31 @@ namespace TH15 {
         }
     });
     EHOOK_ST(th15_native_spell_capture, 0x420e3a, 1, {
+        TH15ChapterSave::singleton().NativeSpellSucceeded();
         if (!g_th15NativeCaptureRateEnabled) {
             ++pCtx->Eax;
             pCtx->Eip = 0x420e3d;
         }
     });
     EHOOK_ST(th15_native_spell_capture_total, 0x420e58, 1, {
+        TH15ChapterSave::singleton().NativeSpellSucceeded();
         if (!g_th15NativeCaptureRateEnabled) {
             ++pCtx->Eax;
             pCtx->Eip = 0x420e5b;
         }
+    });
+
+    // Preserve the outgoing logical attempt around the game's own SpellCard
+    // finalizer. The success-only tail still runs for saturated history counts,
+    // replay playback and when native-history increments are intentionally off.
+    EHOOK_ST(th15_native_spell_before, 0x42ca5a, 5, {
+        TH15ChapterSave::singleton().NativeSpellBefore();
+    });
+    EHOOK_ST(th15_native_spell_success, 0x420e5b, 1, {
+        TH15ChapterSave::singleton().NativeSpellSucceeded();
+    });
+    EHOOK_ST(th15_native_spell_after, 0x42ca5f, 7, {
+        TH15ChapterSave::singleton().NativeSpellAfter();
     });
 
     EHOOK_ST(th15_chapter_set, 0x43dd58, 6, {
@@ -7698,19 +8009,14 @@ namespace TH15 {
     {
         ReportPluginStage(nullptr);
         auto& chapterSave = TH15ChapterSave::singleton();
-        chapterSave.SetCaptureRateEnabled(g_th15CaptureRateEnabled || g_th15ScoreRecordingEnabled || g_th15ChapterHudEnabled);
+        chapterSave.BeginRunCounterReset();
         g_th15OnlyCurrentPracticeChapterThisRun = thPracParam.mode == 1
             && g_th15OnlyCurrentPracticeChapter;
         g_th15NativeCaptureRateEnabled = g_th15CaptureRateEnabled
             && !g_th15OnlyCurrentPracticeChapterThisRun;
-        chapterSave.SetOnlyCurrentPracticeChapter(g_th15OnlyCurrentPracticeChapterThisRun);
         TH15InGameInfo::singleton().mBombCount = 0;
         TH15InGameInfo::singleton().mMissCount = 0;
-        chapterSave.BeginRun(
-            *(int32_t*)0x4E73F0, 0, 0,
-            thPracParam.mode, thPracParam.section, thPracParam.stage,
-            *(int32_t*)0x4E7410, *(int32_t*)0x4E7404,
-            THGuiRep::singleton().mRepStatus);
+        chapterSave.EndRunCounterReset();
     })
     EHOOK_DY(th15_bomb_dec, 0x41497A,5, // bomb dec
     {
@@ -7778,6 +8084,12 @@ namespace TH15 {
         th15_native_spell_capture.Enable();
         th15_native_spell_capture_total.Setup();
         th15_native_spell_capture_total.Enable();
+        th15_native_spell_before.Setup();
+        th15_native_spell_before.Enable();
+        th15_native_spell_success.Setup();
+        th15_native_spell_success.Enable();
+        th15_native_spell_after.Setup();
+        th15_native_spell_after.Enable();
         th15_chapter_set.Setup();
         th15_chapter_set.Enable();
         th15_chapter_bullets_cleared.Setup();

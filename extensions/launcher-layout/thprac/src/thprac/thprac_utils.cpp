@@ -3,7 +3,7 @@
 #include "thprac_launcher_main.h"
 #include "thprac_launcher_cfg.h"
 #include <metrohash128.h>
-#include "../3rdParties/d3d8/include/d3d8.h"
+#include <legacy-dx8/d3d8.h>
 #include <dinput.h>
 #include <set>
 #include <format>

@@ -1,3 +1,4 @@
+#include "quick_practice_adapter.h"
 #include "feature_runtime.h"
 #include "thprac_games.h"
 #include "thprac_utils.h"
@@ -154,7 +155,7 @@ namespace TH11 {
             *mPower = 80;
             *mMode = 1;
             *mValue = 50000;
-            *mSpellCategory = globals->chara * 3 + globals->subshot;
+            *mSpellCategory = PracticeShot();
 
             SetFade(0.8f, 0.1f);
             SetStyle(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -164,8 +165,15 @@ namespace TH11 {
         SINGLETON(THGuiPrac)
     public:
 
+        THPRAC_PRACTICE_SETTINGS(
+            mMode, mStage, mWarp, mMarisaBFormation, mSection,
+            mPhase, mDlg, mChapter, mLife, mLifeFragment,
+            mGraze, mPower, mScore, mValue, mSpellCategory,
+            mBossX, mBossY, mWavePassed)
+
         __declspec(noinline) void State(int state)
         {
+            const auto* preview = QuickPractice::Preview();
             uint32_t mainShot;
             uint32_t subShot;
 
@@ -173,9 +181,9 @@ namespace TH11 {
             case 0:
                 break;
             case 1:
-                mDiffculty = *((int32_t*)0x4a5720);
-                mainShot = GetMemContent(0x4a8ecc, 0x38);
-                subShot = GetMemContent(0x4a8ecc, 0x3c);
+                mDiffculty = preview ? preview->difficulty : *((int32_t*)0x4a5720);
+                mainShot = preview ? preview->shot / 3 : GetMemContent(0x4a8ecc, 0x38);
+                subShot = preview ? preview->shot % 3 : GetMemContent(0x4a8ecc, 0x3c);
                 if (mainShot == 1 && subShot == 0) {
                     if (!isMarisaA) {
                         mPower.SetBound(0, 96);
@@ -199,6 +207,8 @@ namespace TH11 {
                 SetFade(0.8f, 0.1f);
                 Close();
                 *mNavFocus = 0;
+
+                if (QuickPractice::UseParameters(thPracParam)) break;
 
                 // Fill Param
                 thPracParam.mode = *mMode;
@@ -234,6 +244,12 @@ namespace TH11 {
         }
 
     protected:
+        static int PracticeShot()
+        {
+            const auto* preview = QuickPractice::Preview();
+            return preview ? preview->shot : globals->chara * 3 + globals->subshot;
+        }
+
         virtual void OnLocaleChange() override
         {
             SetTitle(S(TH_MENU));
@@ -283,7 +299,7 @@ namespace TH11 {
         void PracticeMenu()
         {
             static int32_t last_player_type = 0;
-            int32_t player_type = globals->chara * 3 + globals->subshot;
+            int32_t player_type = PracticeShot();
             Gui::PracticeSection(false);
             mMode();
             if (player_type != last_player_type) {
@@ -339,7 +355,7 @@ namespace TH11 {
                 mValue.RoundDown(10);
                 mScore();
                 mScore.RoundDown(10);
-                if (globals->chara == 1 && globals->subshot == 1) {
+                if (player_type == 4) {
                     mMarisaBFormation();
                 }
             }
@@ -477,6 +493,8 @@ namespace TH11 {
         int mDiffculty = 0;
         bool isMarisaA = false;
     };
+
+    THPRAC_PRACTICE_EDITOR()
     class THGuiRep : public Gui::GameGuiWnd {
         THGuiRep() noexcept
         {
@@ -2462,9 +2480,6 @@ namespace TH11 {
         if (static_cast<int32_t>(pCtx->Eax) < 0) BossCaptureScriptExit(owner);
         else BossCaptureConfiguredCurrent(owner);
     })
-    EHOOK_ADDON_DY(th11_capture_observe, 0x417d80, 6, (1u << static_cast<unsigned>(Addon::Capture)), {
-        BossCaptureObservedCurrent(GetMemContent<uintptr_t>(pCtx->Eax+0x1614));
-    })
     EHOOK_ADDON_DY(th11_capture_config_short, 0x417ad0, 3, (1u << static_cast<unsigned>(Addon::Capture)), {
         BossCaptureConfiguredCurrent(pCtx->Edx);
     })
@@ -2521,6 +2536,7 @@ namespace TH11 {
         BossCaptureAttach(CaptureNativeContext, CaptureNativeLabel);
         EnableAllHooks(THMainHook);
         EnableAllHooks(THInGameInfo);
+        BossCaptureInstallNativeSpellEvents(11);
         // Reset thPracParam
         thPracParam.Reset();
     }

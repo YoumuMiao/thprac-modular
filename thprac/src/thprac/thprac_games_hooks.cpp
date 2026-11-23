@@ -1,7 +1,7 @@
 
 #include "thprac_games_hooks.h"
 #include <vector>
-#include "../3rdParties/d3d8/include/dsound.h"
+#include <legacy-dx8/dsound.h>
 #include "thprac_hook.h"
 #include <string>
 #include "thprac_utils.h"

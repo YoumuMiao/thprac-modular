@@ -1,0 +1,6 @@
+{
+  "zh": "在启动器「工具 → 背景音乐」选择作品、曲目和任意位置的替换音频。游戏读取独立的替换文件。",
+  "en": "Choose a game, track, and replacement audio file in the launcher's Tools → Background Music page. Replacements are stored separately.",
+  "ja": "ランチャーのツール画面から作品・曲・差し替え音声ファイルを選べます。差し替え音声は別ファイルとして保存されます。",
+  "settings": true
+}

@@ -118,6 +118,7 @@ namespace Gui {
         static constexpr ImGuiWindowFlags STYLE_DEFAULT = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus | 0;
 
         void Update();
+        void DrawPracticeContents() { OnContentUpdate(); }
         void SetMouseOnly();
         void SetPracticePanel() { mPracticePanel = true; }
         static bool MouseOnlyWindowOpen();
@@ -553,6 +554,14 @@ namespace Gui {
         {
             return mCurrent;
         }
+        bool IsValidSelection(int value) const
+        {
+            if (value < 0) return false;
+            if (!mSelector) return true;
+            int count = 0;
+            while (mSelector[count]) ++count;
+            return value < count;
+        }
         bool operator()(int skip);
         bool operator()() {
             return (*this)(-1);
@@ -611,6 +620,10 @@ namespace Gui {
         template <typename T>
         inline void CheckComboItemNew(T* selector, const char** items, int nav)
         {
+            int count = 0;
+            while (selector[count]) ++count;
+            if (!count) return;
+            if (mCurrent < 0 || mCurrent >= count) mCurrent = 0;
             const int origin = mCurrent;
             while (true) {
                 if (*items[selector[mCurrent]])

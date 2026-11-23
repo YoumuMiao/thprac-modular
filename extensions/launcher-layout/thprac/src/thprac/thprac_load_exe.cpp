@@ -1,5 +1,6 @@
 #include <imgui.h>
 #include "host_apply.h"
+#include "quick_practice_launcher.h"
 #include "thprac_load_exe.h"
 #include "thprac_launcher_games.h"
 #include "utils/utils.h"
@@ -109,6 +110,7 @@ bool HasPluginManager()
 void __cdecl RefreshPluginTools()
 {
     if (HasPluginManager()) launcherHost->refresh_plugins();
+    QuickPractice::RefreshLauncherSources();
 }
 
 int __cdecl DrawPluginSettings(const wchar_t* path, const ThpracPluginUi* ui)
